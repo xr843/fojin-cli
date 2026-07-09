@@ -1,0 +1,8 @@
+The data artifact distributed with fojin-cli (fojin-parallels-*.sqlite[.gz])
+is licensed CC BY-SA 4.0.
+
+Attribution: Dharmamitra (https://dharmamitra.org) + fojin.app.
+Source alignments imported from Dharmamitra's open MITRA dataset.
+
+Note: this artifact contains MITRA cross-canon parallels ONLY. fojin's own
+curated alignment_pairs are NOT included.

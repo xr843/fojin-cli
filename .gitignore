@@ -1,0 +1,5 @@
+/target
+*.sqlite
+*.sqlite.gz
+*.sqlite.gz.sha256
+__pycache__/
