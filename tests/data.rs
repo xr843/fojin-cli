@@ -42,3 +42,13 @@ fn present_file_is_a_noop() {
     // must NOT attempt download when file already exists
     assert!(ensure_data(&path, false, &src).is_ok());
 }
+
+#[test]
+fn write_atomic_writes_content_and_leaves_no_temp() {
+    use fojin_cli::data::write_atomic;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    write_atomic(&path, b"payload").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+    assert!(!path.with_extension("tmp").exists(), "temp sibling must not remain");
+}

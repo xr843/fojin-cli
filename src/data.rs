@@ -31,6 +31,16 @@ pub fn gunzip(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Write `bytes` to `path` atomically: write a temp sibling then rename.
+/// Rename is atomic on the same filesystem, so a crash mid-write can never
+/// leave a corrupt file at `path` that a later `ensure_data` run would trust.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).with_context(|| format!("写入临时文件失败: {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("原子替换数据文件失败: {}", path.display()))?;
+    Ok(())
+}
+
 pub fn ensure_data(path: &Path, offline: bool, source: &DataSource) -> Result<()> {
     if path.exists() {
         return Ok(());
@@ -50,7 +60,7 @@ pub fn ensure_data(path: &Path, offline: bool, source: &DataSource) -> Result<()
         return Err(anyhow!("下载校验失败(sha256 不符)。请重试或手动下载: {}", source.url));
     }
     let raw = gunzip(&gz)?;
-    std::fs::write(path, raw).context("写入数据文件失败")?;
+    write_atomic(path, &raw)?;
     Ok(())
 }
 
