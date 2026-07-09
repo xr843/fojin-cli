@@ -1,6 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// Connect timeout for the data download: fails fast if the release host is
+/// unreachable rather than hanging forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Overall read ceiling for the data download. The artifact is ~100-200MB,
+/// so this is generous for a slow-but-alive connection while still
+/// guaranteeing the CLI can never hang indefinitely.
+const READ_TIMEOUT: Duration = Duration::from_secs(900);
 
 pub struct DataSource<'a> {
     pub url: &'a str,
@@ -56,11 +65,18 @@ pub fn ensure_data(path: &Path, offline: bool, source: &DataSource) -> Result<()
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("创建缓存目录失败")?;
     }
-    let gz = http_get(source.url)?;
+    let gz = http_get(source.url).map_err(|e| {
+        anyhow!(
+            "{e:#}\n请手动下载:\n  {}\n解压后放到: {}",
+            source.url,
+            path.display()
+        )
+    })?;
     if !verify_sha256(&gz, source.sha256) {
         return Err(anyhow!(
-            "下载校验失败(sha256 不符)。请重试或手动下载: {}",
-            source.url
+            "下载校验失败(sha256 不符)。请重试或手动下载:\n  {}\n解压后放到: {}",
+            source.url,
+            path.display()
         ));
     }
     let raw = gunzip(&gz)?;
@@ -69,7 +85,12 @@ pub fn ensure_data(path: &Path, offline: bool, source: &DataSource) -> Result<()
 }
 
 fn http_get(url: &str) -> Result<Vec<u8>> {
-    let resp = ureq::get(url)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(READ_TIMEOUT)
+        .build();
+    let resp = agent
+        .get(url)
         .call()
         .with_context(|| format!("下载失败: {url}"))?;
     let mut buf = Vec::new();
