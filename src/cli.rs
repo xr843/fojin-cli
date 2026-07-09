@@ -9,8 +9,7 @@ use crate::{data, normalize, query, render};
 /// Release process sets DATA_SHA256 to the published artifact's checksum.
 pub const DATA_URL: &str =
     "https://github.com/xr843/fojin-cli/releases/download/data-v1/fojin-parallels-v1.sqlite.gz";
-pub const DATA_SHA256: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+pub const DATA_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Parser)]
 #[command(name = "fojin", version, about = "fojin 跨藏对读 CLI(离线 · 无需登录)")]
@@ -63,7 +62,14 @@ pub fn compute_output(
 pub fn run() -> Result<i32> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Parallel { query, lang, top, json, data_dir, offline } => {
+        Command::Parallel {
+            query,
+            lang,
+            top,
+            json,
+            data_dir,
+            offline,
+        } => {
             let raw = match query {
                 Some(q) => q,
                 None => {
@@ -77,13 +83,23 @@ pub fn run() -> Result<i32> {
                 return Ok(2);
             }
             let path = data::resolve_data_path(data_dir)?;
-            data::ensure_data(&path, offline, &data::DataSource { url: DATA_URL, sha256: DATA_SHA256 })?;
+            data::ensure_data(
+                &path,
+                offline,
+                &data::DataSource {
+                    url: DATA_URL,
+                    sha256: DATA_SHA256,
+                },
+            )?;
             let conn = data::open_db(&path)?;
             let langs: Option<Vec<String>> = lang.map(|l| {
-                l.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                l.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
             });
             let out = compute_output(&conn, &raw, langs.as_deref(), top, json)?;
-            println!("{}", out);
+            println!("{out}");
             Ok(0)
         }
     }

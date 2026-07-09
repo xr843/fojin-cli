@@ -20,7 +20,7 @@ pub fn verify_sha256(bytes: &[u8], expected_hex: &str) -> bool {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(bytes);
-    let got: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+    let got: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
     got.eq_ignore_ascii_case(expected_hex)
 }
 
@@ -37,7 +37,8 @@ pub fn gunzip(bytes: &[u8]) -> Result<Vec<u8>> {
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).with_context(|| format!("写入临时文件失败: {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("原子替换数据文件失败: {}", path.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("原子替换数据文件失败: {}", path.display()))?;
     Ok(())
 }
 
@@ -57,7 +58,10 @@ pub fn ensure_data(path: &Path, offline: bool, source: &DataSource) -> Result<()
     }
     let gz = http_get(source.url)?;
     if !verify_sha256(&gz, source.sha256) {
-        return Err(anyhow!("下载校验失败(sha256 不符)。请重试或手动下载: {}", source.url));
+        return Err(anyhow!(
+            "下载校验失败(sha256 不符)。请重试或手动下载: {}",
+            source.url
+        ));
     }
     let raw = gunzip(&gz)?;
     write_atomic(path, &raw)?;
@@ -65,9 +69,13 @@ pub fn ensure_data(path: &Path, offline: bool, source: &DataSource) -> Result<()
 }
 
 fn http_get(url: &str) -> Result<Vec<u8>> {
-    let resp = ureq::get(url).call().with_context(|| format!("下载失败: {}", url))?;
+    let resp = ureq::get(url)
+        .call()
+        .with_context(|| format!("下载失败: {url}"))?;
     let mut buf = Vec::new();
-    resp.into_reader().read_to_end(&mut buf).context("读取响应失败")?;
+    resp.into_reader()
+        .read_to_end(&mut buf)
+        .context("读取响应失败")?;
     Ok(buf)
 }
 

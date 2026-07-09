@@ -28,7 +28,10 @@ fn gunzip_roundtrips() {
 fn offline_and_missing_errors_clearly() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.sqlite"); // does not exist
-    let src = DataSource { url: "https://example.invalid/x.gz", sha256: "0" };
+    let src = DataSource {
+        url: "https://example.invalid/x.gz",
+        sha256: "0",
+    };
     let err = ensure_data(&path, true, &src).unwrap_err().to_string();
     assert!(err.contains("offline") || err.contains("手动"));
 }
@@ -38,7 +41,10 @@ fn present_file_is_a_noop() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.sqlite");
     std::fs::write(&path, b"x").unwrap();
-    let src = DataSource { url: "https://example.invalid/x.gz", sha256: "0" };
+    let src = DataSource {
+        url: "https://example.invalid/x.gz",
+        sha256: "0",
+    };
     // must NOT attempt download when file already exists
     assert!(ensure_data(&path, false, &src).is_ok());
 }
@@ -50,5 +56,8 @@ fn write_atomic_writes_content_and_leaves_no_temp() {
     let path = dir.path().join("data.sqlite");
     write_atomic(&path, b"payload").unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"payload");
-    assert!(!path.with_extension("tmp").exists(), "temp sibling must not remain");
+    assert!(
+        !path.with_extension("tmp").exists(),
+        "temp sibling must not remain"
+    );
 }

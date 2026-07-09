@@ -4,8 +4,7 @@ pub type NormMap = HashMap<char, char>;
 
 /// Whitespace + punctuation removed during normalization.
 /// MUST stay byte-for-byte identical to the Python export side.
-pub const STRIP_CHARS: &str =
-    " \t\r\n\u{3000}，。；：！？、,.;:!?“”‘’\"'()（）《》〈〉【】…—-·";
+pub const STRIP_CHARS: &str = " \t\r\n\u{3000}，。；：！？、,.;:!?“”‘’\"'()（）《》〈〉【】…—-·";
 
 pub fn normalize(input: &str, map: &NormMap) -> String {
     input

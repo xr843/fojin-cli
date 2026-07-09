@@ -8,8 +8,16 @@ fn heart() -> MatchGroup {
         title_zh: Some("心經".into()),
         juan_num: Some(1),
         parallels: vec![
-            Parallel { lang: "sa".into(), text: "rūpaṃ śūnyatā".into(), confidence: Some(0.91) },
-            Parallel { lang: "bo".into(), text: "gzugs stong pa".into(), confidence: Some(0.88) },
+            Parallel {
+                lang: "sa".into(),
+                text: "rūpaṃ śūnyatā".into(),
+                confidence: Some(0.91),
+            },
+            Parallel {
+                lang: "bo".into(),
+                text: "gzugs stong pa".into(),
+                confidence: Some(0.88),
+            },
         ],
     }
 }
@@ -39,9 +47,16 @@ fn json_flags_matched() {
 #[test]
 fn human_shows_extra_lang_and_full_footer() {
     let mut g = heart();
-    g.parallels.push(Parallel { lang: "en".into(), text: "form is emptiness".into(), confidence: Some(0.75) });
+    g.parallels.push(Parallel {
+        lang: "en".into(),
+        text: "form is emptiness".into(),
+        confidence: Some(0.75),
+    });
     let out = render_human(&[g]);
-    assert!(out.contains("英  form is emptiness  [MITRA 0.75]"), "extra lang en prints when present");
+    assert!(
+        out.contains("英  form is emptiness  [MITRA 0.75]"),
+        "extra lang en prints when present"
+    );
     // full footer including the CC BY-SA attribution half (a regression to that half must fail)
     assert!(out.contains("完整上下文见 https://fojin.app  ·  数据 CC BY-SA(Dharmamitra + fojin)"));
 }
@@ -63,5 +78,9 @@ fn json_exposes_only_public_fields() {
     assert!(!out.contains("zh_norm"), "internal zh_norm must not leak");
     assert!(!out.contains("\"method\""), "internal method must not leak");
     // sanity: expected public keys present
-    assert!(out.contains("\"zh_text\"") && out.contains("\"parallels\"") && out.contains("\"confidence\""));
+    assert!(
+        out.contains("\"zh_text\"")
+            && out.contains("\"parallels\"")
+            && out.contains("\"confidence\"")
+    );
 }

@@ -1,7 +1,6 @@
 use crate::model::MatchGroup;
 
-pub const FOOTER: &str =
-    "完整上下文见 https://fojin.app  ·  数据 CC BY-SA(Dharmamitra + fojin)";
+pub const FOOTER: &str = "完整上下文见 https://fojin.app  ·  数据 CC BY-SA(Dharmamitra + fojin)";
 
 const DISPLAY_LANGS: [&str; 3] = ["sa", "bo", "pi"];
 
@@ -17,7 +16,7 @@ pub fn lang_label(code: &str) -> &str {
 }
 
 fn conf_tag(c: Option<f64>) -> String {
-    c.map(|v| format!("  [MITRA {:.2}]", v)).unwrap_or_default()
+    c.map(|v| format!("  [MITRA {v:.2}]")).unwrap_or_default()
 }
 
 pub fn render_human(groups: &[MatchGroup]) -> String {
@@ -30,8 +29,8 @@ pub fn render_human(groups: &[MatchGroup]) -> String {
             out.push('\n');
         }
         let src = match (&g.title_zh, &g.cbeta_id, g.juan_num) {
-            (Some(t), Some(c), Some(j)) => format!("  (《{}》{} 卷{})", t, c, j),
-            (Some(t), Some(c), None) => format!("  (《{}》{})", t, c),
+            (Some(t), Some(c), Some(j)) => format!("  (《{t}》{c} 卷{j})"),
+            (Some(t), Some(c), None) => format!("  (《{t}》{c})"),
             _ => String::new(),
         };
         out.push_str(&format!("汉  {}{}\n", g.zh_text, src));
@@ -42,17 +41,27 @@ pub fn render_human(groups: &[MatchGroup]) -> String {
                 out.push_str(&format!("{}  (无对齐)\n", lang_label(code)));
             } else {
                 for p in items {
-                    out.push_str(&format!("{}  {}{}\n", lang_label(code), p.text, conf_tag(p.confidence)));
+                    out.push_str(&format!(
+                        "{}  {}{}\n",
+                        lang_label(code),
+                        p.text,
+                        conf_tag(p.confidence)
+                    ));
                 }
             }
         }
         for p in &g.parallels {
             if !DISPLAY_LANGS.contains(&p.lang.as_str()) {
-                out.push_str(&format!("{}  {}{}\n", lang_label(&p.lang), p.text, conf_tag(p.confidence)));
+                out.push_str(&format!(
+                    "{}  {}{}\n",
+                    lang_label(&p.lang),
+                    p.text,
+                    conf_tag(p.confidence)
+                ));
             }
         }
     }
-    out.push_str(&format!("\n{}\n", FOOTER));
+    out.push_str(&format!("\n{FOOTER}\n"));
     out
 }
 

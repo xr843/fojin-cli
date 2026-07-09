@@ -6,9 +6,36 @@ fn fixture() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let rows = [
-        ("色即是空", "色即是空", "sa", "rūpaṃ śūnyatā", 0.91, "T0251", "心經", 1),
-        ("色即是空", "色即是空", "bo", "gzugs stong pa", 0.88, "T0251", "心經", 1),
-        ("受想行識", "受想行识", "sa", "vedanā saṃjñā", 0.70, "T0251", "心經", 1),
+        (
+            "色即是空",
+            "色即是空",
+            "sa",
+            "rūpaṃ śūnyatā",
+            0.91,
+            "T0251",
+            "心經",
+            1,
+        ),
+        (
+            "色即是空",
+            "色即是空",
+            "bo",
+            "gzugs stong pa",
+            0.88,
+            "T0251",
+            "心經",
+            1,
+        ),
+        (
+            "受想行識",
+            "受想行识",
+            "sa",
+            "vedanā saṃjñā",
+            0.70,
+            "T0251",
+            "心經",
+            1,
+        ),
     ];
     for (zt, zn, lang, f, c, cb, ti, j) in rows {
         conn.execute(
@@ -70,7 +97,10 @@ fn per_lang_cap_and_order() {
     let sa: Vec<_> = g[0].parallels.iter().filter(|p| p.lang == "sa").collect();
     assert_eq!(sa.len(), 2, "capped to top=2 per language");
     assert_eq!(sa[0].text, "sa-hi", "highest confidence first");
-    assert_eq!(sa[1].text, "sa-mid", "second highest; lowest (sa-lo) dropped");
+    assert_eq!(
+        sa[1].text, "sa-mid",
+        "second highest; lowest (sa-lo) dropped"
+    );
 }
 
 #[test]

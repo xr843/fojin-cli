@@ -45,7 +45,7 @@ fn fetch_rows(conn: &Connection, norm_query: &str) -> rusqlite::Result<Vec<Row>>
             "SELECT zh_text,zh_norm,foreign_lang,foreign_text,confidence,\
                     cbeta_id,title_zh,juan_num \
              FROM parallels WHERE zh_norm LIKE ?1",
-            format!("%{}%", norm_query),
+            format!("%{norm_query}%"),
         )
     };
     let mut stmt = conn.prepare(sql)?;
@@ -88,9 +88,9 @@ fn group_and_rank(
             }
         }
         let contains = row.zh_norm.contains(norm_query);
-        let idx = accs
-            .iter()
-            .position(|a| a.zh_text == row.zh_text && a.cbeta_id == row.cbeta_id && a.juan_num == row.juan_num);
+        let idx = accs.iter().position(|a| {
+            a.zh_text == row.zh_text && a.cbeta_id == row.cbeta_id && a.juan_num == row.juan_num
+        });
         let idx = match idx {
             Some(i) => i,
             None => {
