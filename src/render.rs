@@ -19,10 +19,14 @@ fn conf_tag(c: Option<f64>) -> String {
     c.map(|v| format!("  [MITRA {v:.2}]")).unwrap_or_default()
 }
 
-pub fn render_human(groups: &[MatchGroup]) -> String {
+pub fn render_human(groups: &[MatchGroup], langs: Option<&[String]>) -> String {
     if groups.is_empty() {
         return "未找到对齐\n".to_string();
     }
+    let display: Vec<String> = match langs {
+        Some(filter) if !filter.is_empty() => filter.to_vec(),
+        _ => DISPLAY_LANGS.iter().map(|s| s.to_string()).collect(),
+    };
     let mut out = String::new();
     for (gi, g) in groups.iter().enumerate() {
         if gi > 0 {
@@ -35,8 +39,8 @@ pub fn render_human(groups: &[MatchGroup]) -> String {
         };
         out.push_str(&format!("汉  {}{}\n", g.zh_text, src));
 
-        for code in DISPLAY_LANGS {
-            let items: Vec<_> = g.parallels.iter().filter(|p| p.lang == code).collect();
+        for code in &display {
+            let items: Vec<_> = g.parallels.iter().filter(|p| &p.lang == code).collect();
             if items.is_empty() {
                 out.push_str(&format!("{}  (无对齐)\n", lang_label(code)));
             } else {
@@ -50,14 +54,16 @@ pub fn render_human(groups: &[MatchGroup]) -> String {
                 }
             }
         }
-        for p in &g.parallels {
-            if !DISPLAY_LANGS.contains(&p.lang.as_str()) {
-                out.push_str(&format!(
-                    "{}  {}{}\n",
-                    lang_label(&p.lang),
-                    p.text,
-                    conf_tag(p.confidence)
-                ));
+        if langs.is_none() {
+            for p in &g.parallels {
+                if !display.iter().any(|d| d == &p.lang) {
+                    out.push_str(&format!(
+                        "{}  {}{}\n",
+                        lang_label(&p.lang),
+                        p.text,
+                        conf_tag(p.confidence)
+                    ));
+                }
             }
         }
     }

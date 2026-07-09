@@ -55,7 +55,7 @@ pub fn compute_output(
     Ok(if json {
         render::render_json(&groups)
     } else {
-        render::render_human(&groups)
+        render::render_human(&groups, langs)
     })
 }
 

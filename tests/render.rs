@@ -24,7 +24,7 @@ fn heart() -> MatchGroup {
 
 #[test]
 fn human_shows_parallels_wuduiqi_and_footer() {
-    let out = render_human(&[heart()]);
+    let out = render_human(&[heart()], None);
     assert!(out.contains("汉  色即是空  (《心經》T0251 卷1)"));
     assert!(out.contains("梵  rūpaṃ śūnyatā  [MITRA 0.91]"));
     assert!(out.contains("藏  gzugs stong pa  [MITRA 0.88]"));
@@ -34,7 +34,7 @@ fn human_shows_parallels_wuduiqi_and_footer() {
 
 #[test]
 fn human_empty_is_honest() {
-    assert_eq!(render_human(&[]).trim(), "未找到对齐");
+    assert_eq!(render_human(&[], None).trim(), "未找到对齐");
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn human_shows_extra_lang_and_full_footer() {
         text: "form is emptiness".into(),
         confidence: Some(0.75),
     });
-    let out = render_human(&[g]);
+    let out = render_human(&[g], None);
     assert!(
         out.contains("英  form is emptiness  [MITRA 0.75]"),
         "extra lang en prints when present"
@@ -63,7 +63,7 @@ fn human_shows_extra_lang_and_full_footer() {
 
 #[test]
 fn human_multi_group_footer_once() {
-    let out = render_human(&[heart(), heart()]);
+    let out = render_human(&[heart(), heart()], None);
     assert_eq!(
         out.matches("完整上下文见 https://fojin.app").count(),
         1,
@@ -82,5 +82,23 @@ fn json_exposes_only_public_fields() {
         out.contains("\"zh_text\"")
             && out.contains("\"parallels\"")
             && out.contains("\"confidence\"")
+    );
+}
+
+#[test]
+fn human_lang_filter_hides_unrequested_and_no_false_wuduiqi() {
+    let langs = vec!["sa".to_string()];
+    let out = render_human(&[heart()], Some(&langs));
+    assert!(
+        out.contains("梵  rūpaṃ śūnyatā"),
+        "requested language shown"
+    );
+    assert!(
+        !out.contains("(无对齐)"),
+        "must NOT print false (无对齐) for a filtered-out language"
+    );
+    assert!(
+        !out.contains("藏"),
+        "filtered-out language must not appear at all"
     );
 }
