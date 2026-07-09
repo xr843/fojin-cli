@@ -52,3 +52,37 @@ fn short_query_uses_like_fallback() {
     assert_eq!(g.len(), 1);
     assert_eq!(g[0].zh_text, "色即是空");
 }
+
+#[test]
+fn per_lang_cap_and_order() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    // one group, three Sanskrit parallels with distinct confidence
+    for (f, c) in [("sa-lo", 0.50_f64), ("sa-hi", 0.95), ("sa-mid", 0.70)] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES ('色即是空','色即是空','sa',?1,?2,'T0251','心經',1)",
+            params![f, c],
+        ).unwrap();
+    }
+    let g = search(&conn, "色即是空", None, 2).unwrap();
+    assert_eq!(g.len(), 1);
+    let sa: Vec<_> = g[0].parallels.iter().filter(|p| p.lang == "sa").collect();
+    assert_eq!(sa.len(), 2, "capped to top=2 per language");
+    assert_eq!(sa[0].text, "sa-hi", "highest confidence first");
+    assert_eq!(sa[1].text, "sa-mid", "second highest; lowest (sa-lo) dropped");
+}
+
+#[test]
+fn top_zero_floors_to_one() {
+    let conn = fixture();
+    let g = search(&conn, "色即是空", None, 0).unwrap();
+    let sa = g[0].parallels.iter().filter(|p| p.lang == "sa").count();
+    assert_eq!(sa, 1, "top=0 floors to 1 per language");
+}
+
+#[test]
+fn empty_query_returns_empty() {
+    let conn = fixture();
+    assert!(search(&conn, "", None, 3).unwrap().is_empty());
+}

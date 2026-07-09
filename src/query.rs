@@ -155,7 +155,7 @@ fn cap_per_lang(parallels: Vec<Parallel>, top: usize) -> Vec<Parallel> {
                 .partial_cmp(&a.confidence.unwrap_or(0.0))
                 .unwrap_or(Ordering::Equal)
         });
-        items.truncate(top.max(1));
+        items.truncate(top.max(1)); // floor of 1: top=0 would yield a useless 0-parallel result
         out.extend(items);
     }
     out
