@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS parallels (
   juan_num     INTEGER
 );
 
+-- Write-once artifact: only an AFTER INSERT trigger syncs the FTS index.
+-- If a future path UPDATEs/DELETEs parallels, add matching triggers or the FTS index desyncs.
 CREATE VIRTUAL TABLE IF NOT EXISTS parallels_fts USING fts5(
   zh_norm,
   content='parallels',
