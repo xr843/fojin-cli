@@ -35,3 +35,33 @@ fn json_flags_matched() {
     assert!(render_json(&[heart()]).contains("\"matched\": true"));
     assert!(render_json(&[heart()]).contains("rūpaṃ śūnyatā"));
 }
+
+#[test]
+fn human_shows_extra_lang_and_full_footer() {
+    let mut g = heart();
+    g.parallels.push(Parallel { lang: "en".into(), text: "form is emptiness".into(), confidence: Some(0.75) });
+    let out = render_human(&[g]);
+    assert!(out.contains("英  form is emptiness  [MITRA 0.75]"), "extra lang en prints when present");
+    // full footer including the CC BY-SA attribution half (a regression to that half must fail)
+    assert!(out.contains("完整上下文见 https://fojin.app  ·  数据 CC BY-SA(Dharmamitra + fojin)"));
+}
+
+#[test]
+fn human_multi_group_footer_once() {
+    let out = render_human(&[heart(), heart()]);
+    assert_eq!(
+        out.matches("完整上下文见 https://fojin.app").count(),
+        1,
+        "footer must appear exactly once across multiple groups"
+    );
+}
+
+#[test]
+fn json_exposes_only_public_fields() {
+    let out = render_json(&[heart()]);
+    // must never surface normalized/internal columns
+    assert!(!out.contains("zh_norm"), "internal zh_norm must not leak");
+    assert!(!out.contains("\"method\""), "internal method must not leak");
+    // sanity: expected public keys present
+    assert!(out.contains("\"zh_text\"") && out.contains("\"parallels\"") && out.contains("\"confidence\""));
+}
