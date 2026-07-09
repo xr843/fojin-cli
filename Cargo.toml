@@ -6,6 +6,10 @@ rust-version = "1.74"
 description = "fojin 跨藏对读 CLI —— 离线查询佛典汉文的梵/巴/藏平行 (offline, no login)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xr843/fojin-cli"
+readme = "README.md"
+homepage = "https://fojin.app"
+keywords = ["buddhist", "sanskrit", "tibetan", "canon", "cli"]
+categories = ["command-line-utilities", "text-processing"]
 
 [lib]
 name = "fojin_cli"
