@@ -32,7 +32,7 @@ fn fixture() -> Connection {
 #[test]
 fn compute_human_output_matches() {
     let conn = fixture();
-    let out = compute_output(&conn, "  色即是空  ", None, 3, false).unwrap();
+    let out = compute_output(&conn, "  色即是空  ", None, 3, None, false).unwrap();
     assert!(out.contains("梵  rūpaṃ śūnyatā  [MITRA 0.91]"));
     assert!(out.contains("巴  (无对齐)"));
 }
@@ -40,7 +40,7 @@ fn compute_human_output_matches() {
 #[test]
 fn compute_json_output_matches() {
     let conn = fixture();
-    let out = compute_output(&conn, "色即是空", None, 3, true).unwrap();
+    let out = compute_output(&conn, "色即是空", None, 3, None, true).unwrap();
     assert!(out.contains("\"matched\": true"));
 }
 
@@ -53,9 +53,36 @@ fn compute_applies_normalization() {
          VALUES ('應無所住','应无所住','sa','apratiṣṭhita',0.8,'T0235','金剛經',1)",
         params![],
     ).unwrap();
-    let out = compute_output(&conn, "應無所住", None, 3, false).unwrap();
+    let out = compute_output(&conn, "應無所住", None, 3, None, false).unwrap();
     assert!(
         out.contains("apratiṣṭhita"),
         "traditional query should match folded zh_norm"
     );
+}
+
+#[test]
+fn compute_limit_caps_groups_and_reports_hidden() {
+    let conn = fixture();
+    // Insert 3 distinct match-groups: same zh_norm substring ("色即是空"), but
+    // different (zh_text, cbeta_id, juan_num) so query::search groups them
+    // separately. The base fixture() already inserts one group; add two more.
+    conn.execute(
+        "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+         VALUES ('色即是空義','色即是空义','sa','rupam2',0.5,'T0252','心經略疏',1)",
+        params![],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+         VALUES ('色即是空論','色即是空论','sa','rupam3',0.4,'T0253','心經釋論',1)",
+        params![],
+    ).unwrap();
+
+    let out = compute_output(&conn, "色即是空", None, 3, Some(2), false).unwrap();
+    assert_eq!(
+        out.matches("汉  ").count(),
+        2,
+        "must show exactly 2 groups' 汉 lines"
+    );
+    assert!(out.contains("还有 1 组"));
+    assert!(out.contains("--all"));
 }

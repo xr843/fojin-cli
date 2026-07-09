@@ -19,7 +19,7 @@ fn conf_tag(c: Option<f64>) -> String {
     c.map(|v| format!("  [MITRA {v:.2}]")).unwrap_or_default()
 }
 
-pub fn render_human(groups: &[MatchGroup], langs: Option<&[String]>) -> String {
+pub fn render_human(groups: &[MatchGroup], langs: Option<&[String]>, hidden: usize) -> String {
     if groups.is_empty() {
         return "未找到对齐\n".to_string();
     }
@@ -67,13 +67,18 @@ pub fn render_human(groups: &[MatchGroup], langs: Option<&[String]>) -> String {
             }
         }
     }
+    if hidden > 0 {
+        out.push_str(&format!("\n… 还有 {hidden} 组匹配,加 --all 查看全部\n"));
+    }
     out.push_str(&format!("\n{FOOTER}\n"));
     out
 }
 
-pub fn render_json(groups: &[MatchGroup]) -> String {
+pub fn render_json(groups: &[MatchGroup], total: usize) -> String {
     let v = serde_json::json!({
         "matched": !groups.is_empty(),
+        "total": total,
+        "shown": groups.len(),
         "groups": groups,
     });
     serde_json::to_string_pretty(&v).unwrap()

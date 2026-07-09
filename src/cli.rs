@@ -30,6 +30,12 @@ pub enum Command {
         /// 每语最多 N 条
         #[arg(long, default_value_t = 3)]
         top: usize,
+        /// 最多显示 N 组匹配
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// 显示全部匹配组,忽略 --limit
+        #[arg(long)]
+        all: bool,
         /// 机器可读 JSON 输出
         #[arg(long)]
         json: bool,
@@ -47,15 +53,23 @@ pub fn compute_output(
     raw: &str,
     langs: Option<&[String]>,
     top: usize,
+    limit: Option<usize>,
     json: bool,
 ) -> Result<String> {
     let map = normalize::load_norm_map(conn)?;
     let norm = normalize::normalize(raw.trim(), &map);
-    let groups = query::search(conn, &norm, langs, top)?;
+    let groups_all = query::search(conn, &norm, langs, top)?;
+    let total = groups_all.len();
+    let shown = match limit {
+        Some(n) => n.min(total),
+        None => total,
+    };
+    let shown_groups = &groups_all[..shown];
+    let hidden = total - shown;
     Ok(if json {
-        render::render_json(&groups)
+        render::render_json(shown_groups, total)
     } else {
-        render::render_human(&groups, langs)
+        render::render_human(shown_groups, langs, hidden)
     })
 }
 
@@ -66,6 +80,8 @@ pub fn run() -> Result<i32> {
             query,
             lang,
             top,
+            limit: limit_flag,
+            all,
             json,
             data_dir,
             offline,
@@ -98,7 +114,8 @@ pub fn run() -> Result<i32> {
                     .filter(|s| !s.is_empty())
                     .collect()
             });
-            let out = compute_output(&conn, &raw, langs.as_deref(), top, json)?;
+            let limit = if all { None } else { Some(limit_flag) };
+            let out = compute_output(&conn, &raw, langs.as_deref(), top, limit, json)?;
             println!("{out}");
             Ok(0)
         }
