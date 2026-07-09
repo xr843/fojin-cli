@@ -3,3 +3,6 @@
 *.sqlite.gz
 *.sqlite.gz.sha256
 __pycache__/
+
+# internal design docs (spec/plan) kept out of the public repo
+/docs/
