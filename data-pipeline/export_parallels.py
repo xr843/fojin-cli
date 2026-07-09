@@ -37,11 +37,14 @@ def build_norm_map() -> dict:
 
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
 
+# Public projection: MITRA parallels joined to buddhist_texts only for the
+# display title (经名). taisho_id (e.g. "T0251") is the cbeta_id we ship.
+# NO fojin-internal columns (method/provenance/internal ids) are selected.
 SELECT_SQL = """
 SELECT ma.zh_text, ma.foreign_lang, ma.foreign_text, ma.confidence,
-       t.cbeta_id, t.title_zh, ma.juan_num
+       bt.cbeta_id, bt.title_zh, ma.juan_num
 FROM mitra_alignments ma
-JOIN texts t ON t.id = ma.text_id
+JOIN buddhist_texts bt ON bt.id = ma.text_id
 WHERE ma.foreign_text <> '' AND ma.zh_text <> ''
 """
 

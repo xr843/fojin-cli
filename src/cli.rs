@@ -9,7 +9,7 @@ use crate::{data, normalize, query, render};
 /// Release process sets DATA_SHA256 to the published artifact's checksum.
 pub const DATA_URL: &str =
     "https://github.com/xr843/fojin-cli/releases/download/data-v1/fojin-parallels-v1.sqlite.gz";
-pub const DATA_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+pub const DATA_SHA256: &str = "e9a203a9f4021fca880e997b26aae134814f1ab34ce3f284a963b7320211fa7f";
 
 #[derive(Parser)]
 #[command(name = "fojin", version, about = "fojin 跨藏对读 CLI(离线 · 无需登录)")]
