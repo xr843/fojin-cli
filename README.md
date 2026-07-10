@@ -5,7 +5,7 @@
 [![release](https://img.shields.io/github/v/release/xr843/fojin-cli?filter=v*&label=release)](https://github.com/xr843/fojin-cli/releases/latest)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可)
 
-**离线 · 无需登录 · 单二进制。** 给一段汉文,查它在梵/巴/藏正典中的平行文本。本地查询毫秒级(实测典型 2 ms,数千组命中的高频词约 0.3 s)。
+**离线 · 无需登录 · 单二进制。** 给一段汉文,查它在梵/藏正典中的平行文本。本地查询毫秒级(实测典型 2 ms,数千组命中的高频词约 0.3 s)。
 
 *English readers: see the [English summary](#english-summary) at the bottom.*
 
@@ -14,7 +14,6 @@ $ fojin parallel "色即是空"
 汉  色不異空，空不異色，色即是空，空即是色；  (《般若波羅蜜多心經》T0251 卷1)
 梵  śūnyat'aiva rūpaṃ, rūpān na pṛthak śūnyatā …  [MITRA 1.00]
 藏  གཟུགས་ལས་སྟོང་པ་ཉིད་གཞན་མ་ཡིན༏ …  [MITRA 1.00]
-巴  (无对齐)
 
 … 还有 38 组匹配,加 --all 查看全部
 
@@ -54,7 +53,7 @@ echo "色即是空" | fojin parallel    # 或从 stdin 读取
 
 | flag | 说明 | 默认值 |
 | --- | --- | --- |
-| `--lang sa,bo` | 只看指定语种,逗号分隔(如 `sa,bo,pi`) | 显示 sa/bo/pi |
+| `--lang sa,bo` | 只看指定语种,逗号分隔 | 显示 sa/bo |
 | `--top N` | 每个语种最多显示 N 条平行(N ≥ 1) | `3` |
 | `--limit N` | 最多显示 N 组匹配(N ≥ 1) | `10` |
 | `--all` | 显示全部匹配组,忽略 `--limit` | — |
@@ -162,7 +161,7 @@ fojin parallel "<汉文短语>" --json --offline
   - 梵 / Sanskrit:231,722 条
 - 来源:Dharmamitra 的 [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) 对齐数据集([Nehrdich & Keutzer, 2026](https://arxiv.org/pdf/2601.06400)),以 GitHub Release(`data-v1`)形式分发;学术使用请引用原论文(BibTeX 见 [`DATA_LICENSE`](DATA_LICENSE))。
 - 首次运行时下载,压缩包约 **183 MB**,解压后约 **561 MB**(SQLite)。下载后完全离线可用。
-- 当前不含巴利对齐,`pi` 恒显示「(无对齐)」;不想看到该行可用 `--lang sa,bo`。
+- 当前不含巴利对齐(上游 MITRA-parallel 尚未覆盖巴利),默认输出不显示巴利行;显式 `--lang pi` 仍可查询(如实答「未找到对齐」)。上游补充后将随新数据版本自动显示,无需升级程序。
 - 许可:**CC BY-SA 4.0**(Dharmamitra + fojin)。
 - 范围:仅含 MITRA 跨藏平行;fojin 自有的精选对齐(alignment_pairs)**未包含**在本数据集中。
 - 未来可能提供体积更小的 lite 子集,供带宽/存储受限场景使用(尚未实现)。

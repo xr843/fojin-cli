@@ -34,7 +34,8 @@ fn compute_human_output_matches() {
     let conn = fixture();
     let out = compute_output(&conn, "  色即是空  ", None, 3, None, false).unwrap();
     assert!(out.contains("梵  rūpaṃ śūnyatā  [MITRA 0.91]"));
-    assert!(out.contains("巴  (无对齐)"));
+    assert!(out.contains("藏  (无对齐)"));
+    assert!(!out.contains("巴"), "no permanent Pali placeholder: {out}");
 }
 
 #[test]

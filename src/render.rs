@@ -2,7 +2,12 @@ use crate::model::MatchGroup;
 
 pub const FOOTER: &str = "完整上下文见 https://fojin.app  ·  数据 CC BY-SA(Dharmamitra + fojin)";
 
-const DISPLAY_LANGS: [&str; 3] = ["sa", "bo", "pi"];
+/// Languages shown by default. Pali is deliberately absent: the current
+/// dataset (data-v1) has zero pi rows, so a permanent "(无对齐)" placeholder
+/// carries no information. Real pi parallels in a future dataset still
+/// surface via the extra-lang path in render_human; explicit --lang pi
+/// still answers with the placeholder.
+const DISPLAY_LANGS: [&str; 2] = ["sa", "bo"];
 
 pub fn lang_label(code: &str) -> &str {
     match code {

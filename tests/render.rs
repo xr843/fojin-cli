@@ -28,8 +28,36 @@ fn human_shows_parallels_wuduiqi_and_footer() {
     assert!(out.contains("汉  色即是空  (《心經》T0251 卷1)"));
     assert!(out.contains("梵  rūpaṃ śūnyatā  [MITRA 0.91]"));
     assert!(out.contains("藏  gzugs stong pa  [MITRA 0.88]"));
-    assert!(out.contains("巴  (无对齐)"));
+    assert!(
+        !out.contains("巴"),
+        "dataset has no Pali; default view must not show a permanent placeholder: {out}"
+    );
     assert!(out.contains("完整上下文见 https://fojin.app"));
+}
+
+#[test]
+fn explicit_lang_pi_still_shows_placeholder() {
+    let langs = vec!["pi".to_string()];
+    let out = render_human(&[heart()], Some(&langs), 0);
+    assert!(
+        out.contains("巴  (无对齐)"),
+        "explicitly requested language must answer honestly: {out}"
+    );
+}
+
+#[test]
+fn future_pali_data_displays_without_binary_change() {
+    let mut g = heart();
+    g.parallels.push(fojin_cli::model::Parallel {
+        lang: "pi".to_string(),
+        text: "rūpaṁ suññatā".to_string(),
+        confidence: Some(0.9),
+    });
+    let out = render_human(&[g], None, 0);
+    assert!(
+        out.contains("巴  rūpaṁ suññatā"),
+        "real Pali parallels must surface via the extra-lang path: {out}"
+    );
 }
 
 #[test]
