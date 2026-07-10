@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use rusqlite::OptionalExtension;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -10,6 +11,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// so this is generous for a slow-but-alive connection while still
 /// guaranteeing the CLI can never hang indefinitely.
 const READ_TIMEOUT: Duration = Duration::from_secs(900);
+
+pub const EXPECTED_DATA_VERSION: &str = "v1";
+pub const EXPECTED_NORM_RULESET: &str = "t2s-char-1to1-v1";
 
 pub struct DataSource<'a> {
     pub url: &'a str,
@@ -163,6 +167,72 @@ pub fn open_db(path: &Path) -> Result<rusqlite::Connection> {
 }
 
 #[derive(Debug, serde::Serialize)]
+pub struct DatasetCompatibility {
+    pub version: String,
+    pub norm_ruleset: String,
+}
+
+pub fn validate_compatibility(conn: &rusqlite::Connection) -> Result<DatasetCompatibility> {
+    require_schema(conn, "meta", "SELECT key, value FROM meta LIMIT 0")?;
+    require_schema(
+        conn,
+        "parallels",
+        "SELECT id, zh_text, zh_norm, foreign_lang, foreign_text, cbeta_id FROM parallels LIMIT 0",
+    )?;
+    require_schema(
+        conn,
+        "norm_map",
+        "SELECT from_char, to_char FROM norm_map LIMIT 0",
+    )?;
+
+    Ok(DatasetCompatibility {
+        version: require_expected_meta(conn, "version", EXPECTED_DATA_VERSION)?,
+        norm_ruleset: require_expected_meta(conn, "norm_ruleset", EXPECTED_NORM_RULESET)?,
+    })
+}
+
+pub fn verify_dataset(conn: &rusqlite::Connection) -> Result<DatasetCompatibility> {
+    let compatibility = validate_compatibility(conn)?;
+    let mut stmt = conn.prepare("PRAGMA quick_check").map_err(|e| {
+        anyhow!(
+            "dataset incompatibility: could not run PRAGMA quick_check: {e}. Run `fojin data update`."
+        )
+    })?;
+    let diagnostics = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| {
+            anyhow!(
+                "dataset incompatibility: could not read PRAGMA quick_check output: {e}. Run `fojin data update`."
+            )
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| {
+            anyhow!(
+                "dataset incompatibility: could not collect PRAGMA quick_check output: {e}. Run `fojin data update`."
+            )
+        })?;
+
+    if diagnostics.as_slice() == ["ok"] {
+        return Ok(compatibility);
+    }
+
+    let summary = if diagnostics.is_empty() {
+        "no diagnostics returned".to_string()
+    } else {
+        diagnostics.join("; ")
+    };
+    Err(anyhow!(
+        "dataset incompatibility: PRAGMA quick_check failed: {summary}. Run `fojin data update`."
+    ))
+}
+
+pub fn open_compatible_db(path: &Path) -> Result<rusqlite::Connection> {
+    let conn = open_db(path)?;
+    validate_compatibility(&conn)?;
+    Ok(conn)
+}
+
+#[derive(Debug, serde::Serialize)]
 pub struct DatasetStats {
     pub version: Option<String>,
     pub license: Option<String>,
@@ -204,4 +274,36 @@ pub fn dataset_stats(conn: &rusqlite::Connection) -> Result<DatasetStats> {
         by_lang,
         texts,
     })
+}
+
+fn require_schema(conn: &rusqlite::Connection, name: &str, sql: &str) -> Result<()> {
+    conn.prepare(sql).map(|_| ()).map_err(|e| {
+        anyhow!(
+            "dataset incompatibility: required schema `{name}` is missing or invalid: {e}. Run `fojin data update`."
+        )
+    })
+}
+
+fn require_expected_meta(conn: &rusqlite::Connection, key: &str, expected: &str) -> Result<String> {
+    let got = conn
+        .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(|e| {
+            anyhow!(
+                "dataset incompatibility: could not read meta `{key}`: {e}. Run `fojin data update`."
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow!(
+                "dataset incompatibility: required meta `{key}` is missing. Run `fojin data update`."
+            )
+        })?;
+
+    if got != expected {
+        return Err(anyhow!(
+            "dataset incompatibility: meta `{key}` expected `{expected}` but found `{got}`. Run `fojin data update`."
+        ));
+    }
+
+    Ok(got)
 }

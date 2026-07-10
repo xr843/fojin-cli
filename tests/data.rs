@@ -1,4 +1,7 @@
-use fojin_cli::data::{ensure_data, gunzip, resolve_data_path, verify_sha256, DataSource};
+use fojin_cli::data::{
+    ensure_data, gunzip, open_compatible_db, resolve_data_path, validate_compatibility,
+    verify_dataset, verify_sha256, DataSource, EXPECTED_DATA_VERSION, EXPECTED_NORM_RULESET,
+};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -173,4 +176,99 @@ fn dataset_stats_reads_meta_and_counts() {
         s.by_lang,
         vec![("bo".to_string(), 1), ("sa".to_string(), 2)]
     );
+}
+
+#[test]
+fn compatibility_accepts_expected_dataset_metadata() {
+    let conn = compatible_conn();
+    let got = validate_compatibility(&conn).unwrap();
+    assert_eq!(got.version, EXPECTED_DATA_VERSION);
+    assert_eq!(got.norm_ruleset, EXPECTED_NORM_RULESET);
+    assert_eq!(
+        serde_json::to_value(&got).unwrap(),
+        serde_json::json!({
+            "version": "v1",
+            "norm_ruleset": "t2s-char-1to1-v1"
+        })
+    );
+}
+
+#[test]
+fn compatibility_rejects_wrong_version() {
+    let conn = compatible_conn();
+    conn.execute("UPDATE meta SET value='v0' WHERE key='version'", [])
+        .unwrap();
+
+    let err = validate_compatibility(&conn).unwrap_err().to_string();
+    assert!(err.contains("version"), "got: {err}");
+    assert!(err.contains(EXPECTED_DATA_VERSION), "got: {err}");
+    assert!(err.contains("fojin data update"), "got: {err}");
+}
+
+#[test]
+fn compatibility_rejects_wrong_norm_ruleset() {
+    let conn = compatible_conn();
+    conn.execute(
+        "UPDATE meta SET value='legacy-rules' WHERE key='norm_ruleset'",
+        [],
+    )
+    .unwrap();
+
+    let err = validate_compatibility(&conn).unwrap_err().to_string();
+    assert!(err.contains("norm_ruleset"), "got: {err}");
+    assert!(err.contains(EXPECTED_NORM_RULESET), "got: {err}");
+    assert!(err.contains("fojin data update"), "got: {err}");
+}
+
+#[test]
+fn compatibility_rejects_missing_required_schema() {
+    let conn = compatible_conn();
+    conn.execute("DROP TABLE norm_map", []).unwrap();
+
+    let err = validate_compatibility(&conn).unwrap_err().to_string();
+    assert!(err.contains("norm_map"), "got: {err}");
+    assert!(err.contains("fojin data update"), "got: {err}");
+}
+
+#[test]
+fn compatibility_open_compatible_db_checks_file_before_returning_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    fojin_cli::schema::init_schema(&conn).unwrap();
+    insert_compat_meta(&conn);
+    drop(conn);
+
+    let conn = open_compatible_db(&path).unwrap();
+    let got = validate_compatibility(&conn).unwrap();
+    assert_eq!(got.version, EXPECTED_DATA_VERSION);
+    assert_eq!(got.norm_ruleset, EXPECTED_NORM_RULESET);
+}
+
+#[test]
+fn verify_dataset_runs_quick_check_on_compatible_db() {
+    let conn = compatible_conn();
+    let got = verify_dataset(&conn).unwrap();
+    assert_eq!(got.version, EXPECTED_DATA_VERSION);
+    assert_eq!(got.norm_ruleset, EXPECTED_NORM_RULESET);
+}
+
+fn compatible_conn() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    fojin_cli::schema::init_schema(&conn).unwrap();
+    insert_compat_meta(&conn);
+    conn
+}
+
+fn insert_compat_meta(conn: &rusqlite::Connection) {
+    for (key, value) in [
+        ("version", EXPECTED_DATA_VERSION),
+        ("norm_ruleset", EXPECTED_NORM_RULESET),
+    ] {
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES (?1,?2)",
+            rusqlite::params![key, value],
+        )
+        .unwrap();
+    }
 }
