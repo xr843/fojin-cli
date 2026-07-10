@@ -604,7 +604,7 @@ fn update_data_preserves_foreign_candidate_artifacts_and_cleans_its_own() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.sqlite");
     std::fs::write(&path, b"old live dataset").unwrap();
-    let foreign_candidate = sibling_path(&path, ".candidate");
+    let foreign_candidate = sibling_path(&path, ".candidate.999999.42");
     for suffix in ["", "-journal", "-shm", "-wal"] {
         std::fs::write(sibling_path(&foreign_candidate, suffix), b"foreign").unwrap();
     }
@@ -624,7 +624,22 @@ fn update_data_preserves_foreign_candidate_artifacts_and_cleans_its_own() {
             b"foreign"
         );
     }
-    assert_no_owned_candidate_artifacts(&path);
+    let candidate_prefix = format!("{}.candidate.", path.file_name().unwrap().to_string_lossy());
+    let remaining: std::collections::BTreeSet<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(&candidate_prefix))
+        .collect();
+    let expected: std::collections::BTreeSet<_> = ["", "-journal", "-shm", "-wal"]
+        .into_iter()
+        .map(|suffix| {
+            sibling_path(&foreign_candidate, suffix)
+                .file_name()
+                .unwrap()
+                .to_os_string()
+        })
+        .collect();
+    assert_eq!(remaining, expected);
 }
 
 #[test]
