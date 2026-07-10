@@ -375,7 +375,7 @@ fn run_data(action: DataAction) -> Result<i32> {
                     path.display()
                 );
             }
-            let conn = data::open_db(&path)?;
+            let conn = data::open_read_only_db(&path)?;
             let compatibility = data::verify_dataset(&conn)?;
             if json {
                 let v = serde_json::json!({

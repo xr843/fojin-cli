@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use rusqlite::OptionalExtension;
+use rusqlite::{OpenFlags, OptionalExtension};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -166,6 +166,11 @@ pub fn open_db(path: &Path) -> Result<rusqlite::Connection> {
     rusqlite::Connection::open(path).with_context(|| format!("打开数据失败: {}", path.display()))
 }
 
+pub fn open_read_only_db(path: &Path) -> Result<rusqlite::Connection> {
+    rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("打开数据失败: {}", path.display()))
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct DatasetCompatibility {
     pub version: String,
@@ -218,7 +223,11 @@ pub fn verify_dataset(conn: &rusqlite::Connection) -> Result<DatasetCompatibilit
             )
         })?;
 
-    if diagnostics.as_slice() == ["ok"] {
+    if !diagnostics.is_empty()
+        && diagnostics
+            .iter()
+            .all(|message| message == "ok" || is_read_only_fts5_check_limitation(message))
+    {
         return Ok(compatibility);
     }
 
@@ -232,8 +241,15 @@ pub fn verify_dataset(conn: &rusqlite::Connection) -> Result<DatasetCompatibilit
     ))
 }
 
+fn is_read_only_fts5_check_limitation(message: &str) -> bool {
+    // SQLite 3.45.0 implements FTS5 xIntegrity through a special INSERT.
+    // SQLite 3.45.1 fixed that command failing on read-only databases.
+    message.starts_with("unable to validate the inverted index for FTS5 table ")
+        && message.ends_with(": attempt to write a readonly database")
+}
+
 pub fn open_compatible_db(path: &Path) -> Result<rusqlite::Connection> {
-    let conn = open_db(path)?;
+    let conn = open_read_only_db(path)?;
     validate_compatibility(&conn)?;
     Ok(conn)
 }

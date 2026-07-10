@@ -1,6 +1,7 @@
 use fojin_cli::data::{
-    ensure_data, gunzip, open_compatible_db, resolve_data_path, validate_compatibility,
-    verify_dataset, verify_sha256, DataSource, EXPECTED_DATA_VERSION, EXPECTED_NORM_RULESET,
+    ensure_data, gunzip, open_compatible_db, open_read_only_db, resolve_data_path,
+    validate_compatibility, verify_dataset, verify_sha256, DataSource, EXPECTED_DATA_VERSION,
+    EXPECTED_NORM_RULESET,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -179,6 +180,23 @@ fn dataset_stats_reads_meta_and_counts() {
 }
 
 #[test]
+fn open_read_only_db_rejects_create_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("CREATE TABLE existing (id INTEGER)", [])
+        .unwrap();
+    drop(conn);
+
+    let conn = open_read_only_db(&path).unwrap();
+    let err = conn
+        .execute("CREATE TABLE forbidden (id INTEGER)", [])
+        .unwrap_err();
+
+    assert_eq!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::ReadOnly));
+}
+
+#[test]
 fn compatibility_accepts_expected_dataset_metadata() {
     let conn = compatible_conn();
     let got = validate_compatibility(&conn).unwrap();
@@ -290,6 +308,22 @@ fn compatibility_open_compatible_db_checks_file_before_returning_connection() {
 fn verify_dataset_runs_quick_check_on_compatible_db() {
     let conn = compatible_conn();
     let got = verify_dataset(&conn).unwrap();
+    assert_eq!(got.version, EXPECTED_DATA_VERSION);
+    assert_eq!(got.norm_ruleset, EXPECTED_NORM_RULESET);
+}
+
+#[test]
+fn verify_dataset_accepts_compatible_read_only_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    fojin_cli::schema::init_schema(&conn).unwrap();
+    insert_compat_meta(&conn);
+    drop(conn);
+
+    let conn = open_read_only_db(&path).unwrap();
+    let got = verify_dataset(&conn).unwrap();
+
     assert_eq!(got.version, EXPECTED_DATA_VERSION);
     assert_eq!(got.norm_ruleset, EXPECTED_NORM_RULESET);
 }
