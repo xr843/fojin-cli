@@ -184,7 +184,7 @@ fojin parallel "<汉文短语>" --json --offline
 **fojin-cli** is an offline command-line tool: give it a Chinese Buddhist canonical passage, it returns the aligned Sanskrit/Tibetan parallels — from a local SQLite, in ~2 ms, fully offline after a one-time 183 MB data download. Single binary, no account, deterministic output.
 
 ```bash
-cargo install fojin-cli          # or: curl -fsSL https://raw.githubusercontent.com/xr843/fojin-cli/master/install.sh | sh
+cargo install fojin-cli --locked # or: curl -fsSL https://raw.githubusercontent.com/xr843/fojin-cli/master/install.sh | sh
 fojin parallel "色即是空"         # Sanskrit + Tibetan parallels with Taishō source refs
 fojin texts "心经"                # fuzzy title search → Taishō numbers
 fojin cite T0251                  # browse one text's alignments in canonical order
