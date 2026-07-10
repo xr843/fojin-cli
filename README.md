@@ -1,10 +1,10 @@
-# fojin-cli — `fojin parallel`
+# fojin-cli
 
 [![CI](https://github.com/xr843/fojin-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/xr843/fojin-cli/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/fojin-cli.svg)](https://crates.io/crates/fojin-cli)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可)
 
-**离线 · 无需登录 · 单二进制。** 给一段汉文,查它在梵/巴/藏正典中的平行文本。
+**离线 · 无需登录 · 单二进制。** 给一段汉文,查它在梵/巴/藏正典中的平行文本。本地查询毫秒级(实测典型 2 ms,数千组命中的高频词约 0.3 s)。
 
 ```
 $ fojin parallel "色即是空"
@@ -28,7 +28,13 @@ $ fojin parallel "色即是空"
 cargo install fojin-cli
 ```
 
-或从 [Releases](https://github.com/xr843/fojin-cli/releases/latest) 下载各平台预编译二进制(Linux x64 / macOS ARM+Intel / Windows x64)；也可从源码安装：
+没有 Rust 环境?一行脚本自动安装对应平台的预编译二进制(Linux x64 / macOS ARM+Intel)：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xr843/fojin-cli/master/install.sh | sh
+```
+
+也可从 [Releases](https://github.com/xr843/fojin-cli/releases/latest) 手动下载各平台二进制(含 Windows x64 zip),或从源码安装：
 
 ```bash
 cargo install --git https://github.com/xr843/fojin-cli
@@ -92,6 +98,42 @@ fojin parallel "色即是空" --json
 ```
 
 (示例取自真实查询 `fojin parallel "应无所住" --json --top 1 --limit 1`,文本有截断;字段实际按字母序输出。)
+
+## 其他子命令
+
+```bash
+fojin texts "心经"        # 模糊查经名(简繁均可) → Taishō 编号 + 各语对齐条数
+fojin cite T0251          # 按编号列出一部经的对齐,经文顺序;--juan N 限定卷
+fojin data status         # 本地数据状态(位置/大小/版本/行数统计)
+fojin data clean          # 删除本地数据,释放 561 MB
+fojin data update         # 重新下载数据(覆盖本地)
+```
+
+`texts` 与 `cite` 支持与 `parallel` 一致的 `--json` / `--data-dir` / `--offline`;
+`cite` 另有 `--lang` / `--top` / `--limit` / `--all`。典型工作流:`texts` 找到编号 → `cite` 通读对齐。
+
+```
+$ fojin texts "心经" | head -3
+T0249  佛說帝釋般若波羅蜜多心經  (藏 50 · 梵 25)
+T0251  般若波羅蜜多心經  (藏 47 · 梵 53)
+T0252  普遍智藏般若波羅蜜多心經  (藏 21 · 梵 48)
+```
+
+## For AI Agents / LLM 工具调用
+
+fojin-cli 是为 agent 设计友好的离线检索原语:**毫秒级、确定性输出、零网络、纯 JSON stdout**。
+需要核对"这段汉文有没有已知梵藏对齐"时,让 agent 调它,比在线 API 快两个数量级且不占配额:
+
+```bash
+fojin parallel "<汉文短语>" --json --offline
+```
+
+- 退出码可编程分支:`0` 成功(看 JSON `matched`)、`1` 运行期错误、`2` 用法错误;进度/提示全在 stderr。
+- 现成集成包见 [`examples/claude/`](examples/claude/):Claude Code 斜杠命令 + CLAUDE.md 片段,
+  其他框架(function calling 等)可照搬其中的调用约定。
+- 边界:无语义搜索、无巴利、无翻译——这三样请接 [Dharmamitra](https://dharmamitra.org) 在线 API,与本工具互补。
+
+更多集成样例(jq 管道、批量查询、Python 调用)见 [`examples/`](examples/)。
 
 ## 输入规则与匹配方式
 
