@@ -131,6 +131,6 @@ fojin parallel "色即是空" --json
 
 ## 生态 / Ecosystem
 
-`fojin-cli` 是 [fojin](https://fojin.app) 开放工具集的一部分 —— fojin.app 提供带账号的在线阅读与对读体验,`fojin-cli` 是其离线、无需登录的命令行对应物,共享同一份跨正典对齐数据。
+`fojin-cli` 是 [fojin](https://fojin.app) 开放工具集的一部分 —— fojin.app 提供带账号的在线阅读与对读体验,`fojin-cli` 是其离线、无需登录的命令行对应物,共享同一份跨藏佛典对齐数据。
 
 <!-- ecosystem: add masterl-kill link once its repo is known -->
