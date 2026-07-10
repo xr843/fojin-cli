@@ -88,6 +88,10 @@ fn zero_limit_is_rejected_during_clap_parsing_before_data_access() {
 }
 
 fn write_fixture_db(dir: &std::path::Path) {
+    write_fixture_db_with_fts(dir, true);
+}
+
+fn write_fixture_db_with_fts(dir: &std::path::Path, rebuild_fts: bool) {
     let conn = Connection::open(dir.join("data.sqlite")).unwrap();
     init_schema(&conn).unwrap();
     for (k, v) in [
@@ -147,6 +151,19 @@ fn write_fixture_db(dir: &std::path::Path) {
         )
         .unwrap();
     }
+    if rebuild_fts {
+        conn.execute(
+            "INSERT INTO parallels_fts(parallels_fts) VALUES('rebuild')",
+            [],
+        )
+        .unwrap();
+    } else {
+        conn.execute(
+            "INSERT INTO parallels_fts(parallels_fts) VALUES('delete-all')",
+            [],
+        )
+        .unwrap();
+    }
 }
 
 fn run_fojin(args: &[&str], dir: &std::path::Path) -> std::process::Output {
@@ -202,6 +219,33 @@ fn data_verify_human_reports_compatibility_summary() {
     assert!(stdout.starts_with("数据校验通过"), "got: {stdout}");
     assert!(stdout.contains("v1"), "got: {stdout}");
     assert!(stdout.contains("t2s-char-1to1-v1"), "got: {stdout}");
+}
+
+#[test]
+fn data_verify_rejects_empty_external_content_fts_index() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_db_with_fts(dir.path(), false);
+
+    let out = run_fojin(&["data", "verify"], dir.path());
+
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stdout.trim().is_empty(), "got stdout: {stdout}");
+    assert!(stderr.contains("FTS5 integrity-check"), "got: {stderr}");
+}
+
+#[test]
+fn data_verify_does_not_modify_database_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_db(dir.path());
+    let path = dir.path().join("data.sqlite");
+    let before = std::fs::read(&path).unwrap();
+
+    let out = run_fojin(&["data", "verify"], dir.path());
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(std::fs::read(path).unwrap(), before);
 }
 
 #[test]

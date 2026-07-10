@@ -23,7 +23,7 @@ case "$os" in
   Linux)
     case "$arch" in
       x86_64) target="x86_64-unknown-linux-gnu" ;;
-      *) die "暂无 Linux/$arch 预编译二进制,请改用: cargo install fojin-cli" ;;
+      *) die "暂无 Linux/$arch 预编译二进制,请改用: cargo install fojin-cli --locked" ;;
     esac ;;
   Darwin)
     case "$arch" in
@@ -34,7 +34,7 @@ case "$os" in
   MINGW*|MSYS*|CYGWIN*)
     die "Windows 请从 Releases 页下载 zip: https://github.com/$REPO/releases/latest" ;;
   *)
-    die "暂不支持 $os,请改用: cargo install fojin-cli" ;;
+    die "暂不支持 $os,请改用: cargo install fojin-cli --locked" ;;
 esac
 
 # Resolve version: newest v* tag (the repo also publishes data-v* releases,

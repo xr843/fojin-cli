@@ -54,7 +54,7 @@ pub enum Command {
         #[arg(long)]
         offline: bool,
     },
-    /// 本地数据管理:状态 / 清理 / 重新下载
+    /// 本地数据管理:状态 / 校验 / 清理 / 重新下载
     Data {
         #[command(subcommand)]
         action: DataAction,
@@ -135,7 +135,7 @@ pub enum DataAction {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
-    /// 校验本地数据版本 / 规范 / SQLite 完整性(不触发下载)
+    /// 校验本地数据版本 / 规范 / SQLite 与 FTS 完整性(不触发下载)
     Verify {
         /// 机器可读 JSON 输出
         #[arg(long)]
@@ -370,8 +370,7 @@ fn run_data(action: DataAction) -> Result<i32> {
                     path.display()
                 );
             }
-            let conn = data::open_read_only_db(&path)?;
-            let compatibility = data::verify_dataset(&conn)?;
+            let compatibility = data::verify_dataset_file(&path)?;
             if json {
                 let v = serde_json::json!({
                     "ok": true,

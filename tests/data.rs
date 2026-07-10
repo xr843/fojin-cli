@@ -600,6 +600,34 @@ fn update_data_preserves_live_dataset_when_candidate_is_corrupt() {
 }
 
 #[test]
+fn update_data_rejects_candidate_with_empty_external_content_fts_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    std::fs::write(&path, b"old live dataset").unwrap();
+    let database = compatible_database_bytes(|conn| {
+        conn.execute(
+            "INSERT INTO parallels(zh_text, zh_norm, foreign_lang, foreign_text) \
+             VALUES ('色即是空', '色即是空', 'sa', 'rupam sunyata')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO parallels_fts(parallels_fts) VALUES('delete-all')",
+            [],
+        )
+        .unwrap();
+    });
+    let gz = gzip_bytes(&database);
+    let sha = sha256_hex(&gz);
+
+    let err = serve_update(&path, gz, &sha).unwrap_err().to_string();
+
+    assert!(err.contains("FTS5 integrity-check"), "got: {err}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old live dataset");
+    assert_no_candidate_artifacts(&path);
+}
+
+#[test]
 fn update_data_preserves_foreign_candidate_artifacts_and_cleans_its_own() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.sqlite");

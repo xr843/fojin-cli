@@ -138,18 +138,12 @@ pub fn update_data(path: &Path, source: &DataSource) -> Result<()> {
         return Err(cleanup_candidate_error(&candidate, error));
     }
 
-    let result = (|| {
-        let conn = open_read_only_db(&candidate)?;
-        verify_dataset(&conn)?;
-        drop(conn);
-
-        replace_with_candidate(path, &candidate)
-    })();
-
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => Err(cleanup_candidate_error(&candidate, error)),
+    let validation_result = verify_dataset_file(&candidate).map(|_| ());
+    if let Err(error) = validation_result {
+        return Err(cleanup_candidate_error(&candidate, error));
     }
+
+    finish_replacement(&candidate, replace_with_candidate(path, &candidate))
 }
 
 fn download_and_unpack(path: &Path, source: &DataSource) -> Result<Vec<u8>> {
@@ -206,6 +200,54 @@ fn cleanup_candidate_error(candidate: &Path, error: anyhow::Error) -> anyhow::Er
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateCleanupPolicy {
+    Remove,
+    #[cfg(any(test, windows))]
+    Preserve,
+}
+
+#[derive(Debug)]
+struct ReplacementFailure {
+    error: anyhow::Error,
+    cleanup: CandidateCleanupPolicy,
+}
+
+impl ReplacementFailure {
+    fn remove(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            cleanup: CandidateCleanupPolicy::Remove,
+        }
+    }
+
+    #[cfg(any(test, windows))]
+    fn preserve(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            cleanup: CandidateCleanupPolicy::Preserve,
+        }
+    }
+}
+
+type ReplacementResult = std::result::Result<(), ReplacementFailure>;
+
+fn finish_replacement(candidate: &Path, result: ReplacementResult) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(failure) => match failure.cleanup {
+            CandidateCleanupPolicy::Remove => {
+                Err(cleanup_candidate_error(candidate, failure.error))
+            }
+            #[cfg(any(test, windows))]
+            CandidateCleanupPolicy::Preserve => Err(failure.error.context(format!(
+                "validated candidate preserved at `{}`",
+                candidate.display()
+            ))),
+        },
+    }
+}
+
 fn remove_candidate_artifacts(candidate: &Path) -> Result<()> {
     for suffix in ["", "-journal", "-shm", "-wal"] {
         let artifact = if suffix.is_empty() {
@@ -226,33 +268,40 @@ fn remove_candidate_artifacts(candidate: &Path) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn replace_with_candidate(path: &Path, candidate: &Path) -> Result<()> {
+fn replace_with_candidate(path: &Path, candidate: &Path) -> ReplacementResult {
     // The candidate is a sibling, so rename atomically replaces the live path
     // on Unix without first removing or moving it away.
-    std::fs::rename(candidate, path).with_context(|| {
-        format!(
-            "替换数据文件失败: {} -> {}",
-            candidate.display(),
-            path.display()
-        )
-    })
+    std::fs::rename(candidate, path)
+        .with_context(|| {
+            format!(
+                "替换数据文件失败: {} -> {}",
+                candidate.display(),
+                path.display()
+            )
+        })
+        .map_err(ReplacementFailure::remove)
 }
 
 #[cfg(windows)]
-fn replace_with_candidate(path: &Path, candidate: &Path) -> Result<()> {
+fn replace_with_candidate(path: &Path, candidate: &Path) -> ReplacementResult {
     match std::fs::metadata(path) {
         Ok(_) => {}
         Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return std::fs::rename(candidate, path).with_context(|| {
-                format!(
-                    "替换数据文件失败: {} -> {}",
-                    candidate.display(),
-                    path.display()
-                )
-            })
+            return std::fs::rename(candidate, path)
+                .with_context(|| {
+                    format!(
+                        "替换数据文件失败: {} -> {}",
+                        candidate.display(),
+                        path.display()
+                    )
+                })
+                .map_err(ReplacementFailure::remove)
         }
         Err(error) => {
-            return Err(error).with_context(|| format!("检查现有数据文件失败: {}", path.display()))
+            return Err(ReplacementFailure::remove(
+                anyhow::Error::new(error)
+                    .context(format!("检查现有数据文件失败: {}", path.display())),
+            ))
         }
     }
 
@@ -281,8 +330,8 @@ fn replace_with_candidate(path: &Path, candidate: &Path) -> Result<()> {
         Ok(encoded)
     }
 
-    let replaced = wide_path(path)?;
-    let replacement = wide_path(candidate)?;
+    let replaced = wide_path(path).map_err(ReplacementFailure::remove)?;
+    let replacement = wide_path(candidate).map_err(ReplacementFailure::remove)?;
     // SAFETY: both path buffers are NUL-terminated UTF-16 and remain alive for
     // the call; optional and reserved pointers are null as ReplaceFileW requires.
     let replaced_ok = unsafe {
@@ -309,7 +358,7 @@ fn handle_windows_replace_failure<F>(
     candidate: &Path,
     native_error: std::io::Error,
     recover: F,
-) -> Result<()>
+) -> ReplacementResult
 where
     F: FnOnce(&Path, &Path) -> std::io::Result<()>,
 {
@@ -321,23 +370,25 @@ where
         Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT | ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) => {
             match recover(candidate, path) {
                 Ok(()) => Ok(()),
-                Err(recovery_error) => Err(anyhow!(
-                    "ReplaceFileW failed for replaced `{}` and replacement `{}` with {}; recovery rename `{} -> {}` failed with {}",
-                    path.display(),
-                    candidate.display(),
-                    describe_windows_error(&native_error),
-                    candidate.display(),
-                    path.display(),
-                    describe_windows_error(&recovery_error)
-                )),
+                Err(recovery_error) => Err(ReplacementFailure::preserve(anyhow!(
+                        "ReplaceFileW failed for replaced `{}` and replacement `{}` with {}; recovery rename `{} -> {}` failed with {}",
+                        path.display(),
+                        candidate.display(),
+                        describe_windows_error(&native_error),
+                        candidate.display(),
+                        path.display(),
+                        describe_windows_error(&recovery_error)
+                    ))),
             }
         }
-        Some(ERROR_UNABLE_TO_REMOVE_REPLACED) => Err(windows_replace_error(
+        Some(ERROR_UNABLE_TO_REMOVE_REPLACED) => Err(ReplacementFailure::remove(
+            windows_replace_error(path, candidate, &native_error),
+        )),
+        _ => Err(ReplacementFailure::remove(windows_replace_error(
             path,
             candidate,
             &native_error,
-        )),
-        _ => Err(windows_replace_error(path, candidate, &native_error)),
+        ))),
     }
 }
 
@@ -467,6 +518,33 @@ pub fn verify_dataset(conn: &rusqlite::Connection) -> Result<DatasetCompatibilit
     ))
 }
 
+pub fn verify_dataset_file(path: &Path) -> Result<DatasetCompatibility> {
+    let compatibility = {
+        let conn = open_read_only_db(path)?;
+        verify_dataset(&conn)?
+    };
+    let conn = rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|error| {
+            anyhow!(
+                "dataset incompatibility: could not open existing dataset for FTS5 integrity-check: {error}. Run `fojin data update`."
+            )
+        })?;
+    verify_fts_content_integrity(&conn)?;
+    Ok(compatibility)
+}
+
+fn verify_fts_content_integrity(conn: &rusqlite::Connection) -> Result<()> {
+    const FTS_CONTENT_INTEGRITY_CHECK: &str =
+        "INSERT INTO parallels_fts(parallels_fts, rank) VALUES('integrity-check', 1)";
+    conn.execute(FTS_CONTENT_INTEGRITY_CHECK, [])
+        .map(|_| ())
+        .map_err(|error| {
+            anyhow!(
+                "dataset incompatibility: FTS5 integrity-check failed: {error}. Run `fojin data update`."
+            )
+        })
+}
+
 pub fn open_compatible_db(path: &Path) -> Result<rusqlite::Connection> {
     let conn = open_read_only_db(path)?;
     validate_compatibility(&conn)?;
@@ -588,6 +666,35 @@ fn require_expected_meta(conn: &rusqlite::Connection, key: &str, expected: &str)
     Ok(got)
 }
 
+#[cfg(test)]
+mod replacement_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn preserve_policy_keeps_validated_candidate_and_reports_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("data.sqlite.candidate.1.1");
+        std::fs::write(&candidate, b"validated dataset").unwrap();
+
+        let error = finish_replacement(
+            &candidate,
+            Err(ReplacementFailure::preserve(anyhow!(
+                "replacement recovery failed"
+            ))),
+        )
+        .unwrap_err();
+
+        assert_eq!(std::fs::read(&candidate).unwrap(), b"validated dataset");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("validated candidate preserved"), "{detail}");
+        assert!(
+            detail.contains(candidate.to_string_lossy().as_ref()),
+            "{detail}"
+        );
+        assert!(detail.contains("replacement recovery failed"), "{detail}");
+    }
+}
+
 #[cfg(all(test, windows))]
 mod windows_replace_failure_tests {
     use super::*;
@@ -629,7 +736,7 @@ mod windows_replace_failure_tests {
 
     fn assert_names_untouched_error_skips_recovery(code: i32) {
         let recovery_called = Cell::new(false);
-        let error = handle_windows_replace_failure(
+        let failure = handle_windows_replace_failure(
             Path::new(LIVE),
             Path::new(CANDIDATE),
             io::Error::from_raw_os_error(code),
@@ -641,7 +748,8 @@ mod windows_replace_failure_tests {
         .unwrap_err();
 
         assert!(!recovery_called.get());
-        let detail = format!("{error:#}");
+        assert_eq!(failure.cleanup, CandidateCleanupPolicy::Remove);
+        let detail = format!("{:#}", failure.error);
         assert!(
             detail.contains(&format!("Windows error {code}")),
             "{detail}"
@@ -667,7 +775,7 @@ mod windows_replace_failure_tests {
     }
 
     fn assert_partial_failure_preserves_both_errors(code: i32) {
-        let error = handle_windows_replace_failure(
+        let failure = handle_windows_replace_failure(
             Path::new(LIVE),
             Path::new(CANDIDATE),
             io::Error::from_raw_os_error(code),
@@ -675,7 +783,8 @@ mod windows_replace_failure_tests {
         )
         .unwrap_err();
 
-        let detail = format!("{error:#}");
+        assert_eq!(failure.cleanup, CandidateCleanupPolicy::Preserve);
+        let detail = format!("{:#}", failure.error);
         assert!(
             detail.contains(&format!("Windows error {code}")),
             "{detail}"
