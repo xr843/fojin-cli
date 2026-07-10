@@ -349,7 +349,9 @@ fn replace_with_candidate(path: &Path, candidate: &Path) -> ReplacementResult {
     }
 
     let native_error = std::io::Error::last_os_error();
-    handle_windows_replace_failure(path, candidate, native_error, std::fs::rename)
+    handle_windows_replace_failure(path, candidate, native_error, |from, to| {
+        std::fs::rename(from, to)
+    })
 }
 
 #[cfg(windows)]
