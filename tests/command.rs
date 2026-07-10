@@ -5,6 +5,13 @@ fn write_offline_db(dir: &std::path::Path) {
     let db_path = dir.join("data.sqlite");
     let conn = Connection::open(db_path).unwrap();
     init_schema(&conn).unwrap();
+    for (k, v) in [("version", "v1"), ("norm_ruleset", "t2s-char-1to1-v1")] {
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES (?1,?2)",
+            rusqlite::params![k, v],
+        )
+        .unwrap();
+    }
 }
 
 #[test]
@@ -81,9 +88,17 @@ fn zero_limit_is_rejected_during_clap_parsing_before_data_access() {
 }
 
 fn write_fixture_db(dir: &std::path::Path) {
+    write_fixture_db_with_fts(dir, true);
+}
+
+fn write_fixture_db_with_fts(dir: &std::path::Path, rebuild_fts: bool) {
     let conn = Connection::open(dir.join("data.sqlite")).unwrap();
     init_schema(&conn).unwrap();
-    for (k, v) in [("version", "v1"), ("license", "CC BY-SA 4.0")] {
+    for (k, v) in [
+        ("version", "v1"),
+        ("norm_ruleset", "t2s-char-1to1-v1"),
+        ("license", "CC BY-SA 4.0"),
+    ] {
         conn.execute(
             "INSERT INTO meta(key,value) VALUES (?1,?2)",
             rusqlite::params![k, v],
@@ -136,6 +151,19 @@ fn write_fixture_db(dir: &std::path::Path) {
         )
         .unwrap();
     }
+    if rebuild_fts {
+        conn.execute(
+            "INSERT INTO parallels_fts(parallels_fts) VALUES('rebuild')",
+            [],
+        )
+        .unwrap();
+    } else {
+        conn.execute(
+            "INSERT INTO parallels_fts(parallels_fts) VALUES('delete-all')",
+            [],
+        )
+        .unwrap();
+    }
 }
 
 fn run_fojin(args: &[&str], dir: &std::path::Path) -> std::process::Output {
@@ -157,6 +185,99 @@ fn data_status_json_reports_dataset() {
     assert!(stdout.contains("\"version\": \"v1\""), "got: {stdout}");
     assert!(stdout.contains("\"total\": 3"), "got: {stdout}");
     assert!(stdout.contains("\"exists\": true"), "got: {stdout}");
+}
+
+#[test]
+fn data_verify_json_reports_exact_compatibility_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_db(dir.path());
+
+    let out = run_fojin(&["data", "verify", "--json"], dir.path());
+
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let got: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        got,
+        serde_json::json!({
+            "ok": true,
+            "version": "v1",
+            "norm_ruleset": "t2s-char-1to1-v1"
+        })
+    );
+}
+
+#[test]
+fn data_verify_human_reports_compatibility_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_db(dir.path());
+
+    let out = run_fojin(&["data", "verify"], dir.path());
+
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.starts_with("数据校验通过"), "got: {stdout}");
+    assert!(stdout.contains("v1"), "got: {stdout}");
+    assert!(stdout.contains("t2s-char-1to1-v1"), "got: {stdout}");
+}
+
+#[test]
+fn data_verify_rejects_empty_external_content_fts_index() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_db_with_fts(dir.path(), false);
+
+    let out = run_fojin(&["data", "verify"], dir.path());
+
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stdout.trim().is_empty(), "got stdout: {stdout}");
+    assert!(stderr.contains("FTS5 integrity-check"), "got: {stderr}");
+}
+
+#[test]
+fn data_verify_does_not_modify_database_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_db(dir.path());
+    let path = dir.path().join("data.sqlite");
+    let before = std::fs::read(&path).unwrap();
+
+    let out = run_fojin(&["data", "verify"], dir.path());
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn data_verify_missing_data_exits_one_without_creating_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_path = dir.path().join("data.sqlite");
+
+    let out = run_fojin(&["data", "verify"], dir.path());
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        !data_path.exists(),
+        "data verify must not create data.sqlite"
+    );
+}
+
+#[test]
+fn incompatible_version_is_rejected_before_parallel_query() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_db(dir.path());
+    let conn = Connection::open(dir.path().join("data.sqlite")).unwrap();
+    conn.execute("UPDATE meta SET value='v0' WHERE key='version'", [])
+        .unwrap();
+
+    let out = run_fojin(&["parallel", "色即是空", "--offline"], dir.path());
+
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stdout.trim().is_empty(), "got stdout: {stdout}");
+    assert!(stderr.contains("dataset incompatibility"), "got: {stderr}");
+    assert!(stderr.contains("version"), "got: {stderr}");
 }
 
 #[test]

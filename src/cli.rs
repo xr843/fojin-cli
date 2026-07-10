@@ -54,7 +54,7 @@ pub enum Command {
         #[arg(long)]
         offline: bool,
     },
-    /// 本地数据管理:状态 / 清理 / 重新下载
+    /// 本地数据管理:状态 / 校验 / 清理 / 重新下载
     Data {
         #[command(subcommand)]
         action: DataAction,
@@ -135,6 +135,15 @@ pub enum DataAction {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// 校验本地数据版本 / 规范 / SQLite 与 FTS 完整性(不触发下载)
+    Verify {
+        /// 机器可读 JSON 输出
+        #[arg(long)]
+        json: bool,
+        /// 指定数据目录(覆盖默认缓存)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 pub fn compute_output(
@@ -190,16 +199,7 @@ pub fn run() -> Result<i32> {
             }
             let preflight = normalize::normalize(raw.trim(), &normalize::NormMap::new());
             normalize::validate_query_length(&preflight)?;
-            let path = data::resolve_data_path(data_dir)?;
-            data::ensure_data(
-                &path,
-                offline,
-                &data::DataSource {
-                    url: DATA_URL,
-                    sha256: DATA_SHA256,
-                },
-            )?;
-            let conn = data::open_db(&path)?;
+            let conn = open_ensured(data_dir, offline)?;
             let langs: Option<Vec<String>> = lang.map(|l| {
                 l.split(',')
                     .map(|s| s.trim().to_string())
@@ -288,7 +288,7 @@ fn open_ensured(data_dir: Option<PathBuf>, offline: bool) -> Result<Connection> 
             sha256: DATA_SHA256,
         },
     )?;
-    data::open_db(&path)
+    data::open_compatible_db(&path)
 }
 
 fn run_data(action: DataAction) -> Result<i32> {
@@ -352,18 +352,38 @@ fn run_data(action: DataAction) -> Result<i32> {
         }
         DataAction::Update { data_dir } => {
             let path = data::resolve_data_path(data_dir)?;
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-            }
-            data::ensure_data(
+            data::update_data(
                 &path,
-                false,
                 &data::DataSource {
                     url: DATA_URL,
                     sha256: DATA_SHA256,
                 },
             )?;
             println!("数据已更新: {}", path.display());
+            Ok(0)
+        }
+        DataAction::Verify { json, data_dir } => {
+            let path = data::resolve_data_path(data_dir)?;
+            if !path.exists() {
+                anyhow::bail!(
+                    "本地数据不存在: {}。请先运行 `fojin data update`。",
+                    path.display()
+                );
+            }
+            let compatibility = data::verify_dataset_file(&path)?;
+            if json {
+                let v = serde_json::json!({
+                    "ok": true,
+                    "version": compatibility.version,
+                    "norm_ruleset": compatibility.norm_ruleset,
+                });
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!(
+                    "数据校验通过 version={} norm_ruleset={}",
+                    compatibility.version, compatibility.norm_ruleset
+                );
+            }
             Ok(0)
         }
     }

@@ -27,7 +27,7 @@ $ fojin parallel "色即是空"
 通过 [crates.io](https://crates.io/crates/fojin-cli) 安装(命令为 `fojin`）：
 
 ```bash
-cargo install fojin-cli
+cargo install fojin-cli --locked
 ```
 
 没有 Rust 环境?一行脚本自动安装对应平台的预编译二进制(Linux x64 / macOS ARM+Intel)：
@@ -39,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/xr843/fojin-cli/master/install.sh |
 也可从 [Releases](https://github.com/xr843/fojin-cli/releases/latest) 手动下载各平台二进制(含 Windows x64 zip),或从源码安装：
 
 ```bash
-cargo install --git https://github.com/xr843/fojin-cli
+cargo install --git https://github.com/xr843/fojin-cli --locked
 ```
 
 首次运行 `fojin parallel` 会自动下载对齐数据集(约 183 MB,带进度显示,见下方「数据集」),之后完全离线。
@@ -109,6 +109,7 @@ fojin cite T0251          # 按编号列出一部经的对齐,经文顺序;--jua
 fojin data status         # 本地数据状态(位置/大小/版本/行数统计)
 fojin data clean          # 删除本地数据,释放 561 MB
 fojin data update         # 重新下载数据(覆盖本地)
+fojin data verify         # 校验版本、SQLite 与 FTS 完整性
 ```
 
 `texts` 与 `cite` 支持与 `parallel` 一致的 `--json` / `--data-dir` / `--offline`;
@@ -184,11 +185,12 @@ fojin parallel "<汉文短语>" --json --offline
 **fojin-cli** is an offline command-line tool: give it a Chinese Buddhist canonical passage, it returns the aligned Sanskrit/Tibetan parallels — from a local SQLite, in ~2 ms, fully offline after a one-time 183 MB data download. Single binary, no account, deterministic output.
 
 ```bash
-cargo install fojin-cli          # or: curl -fsSL https://raw.githubusercontent.com/xr843/fojin-cli/master/install.sh | sh
+cargo install fojin-cli --locked # or: curl -fsSL https://raw.githubusercontent.com/xr843/fojin-cli/master/install.sh | sh
 fojin parallel "色即是空"         # Sanskrit + Tibetan parallels with Taishō source refs
 fojin texts "心经"                # fuzzy title search → Taishō numbers
 fojin cite T0251                  # browse one text's alignments in canonical order
 fojin data status                 # local dataset stats
+fojin data verify                 # verify version, SQLite, and FTS integrity
 ```
 
 - **Input**: Chinese only (traditional/simplified folded, punctuation ignored); literal substring matching over normalized text. 2-to-12-character phrases work best.
