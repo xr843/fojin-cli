@@ -161,3 +161,47 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
 pub fn open_db(path: &Path) -> Result<rusqlite::Connection> {
     rusqlite::Connection::open(path).with_context(|| format!("打开数据失败: {}", path.display()))
 }
+
+#[derive(Debug, serde::Serialize)]
+pub struct DatasetStats {
+    pub version: Option<String>,
+    pub license: Option<String>,
+    pub attribution: Option<String>,
+    pub total: u64,
+    /// (lang, count) sorted by lang code
+    pub by_lang: Vec<(String, u64)>,
+    /// distinct cbeta_id count
+    pub texts: u64,
+}
+
+pub fn dataset_stats(conn: &rusqlite::Connection) -> Result<DatasetStats> {
+    let meta_get = |key: &str| -> Result<Option<String>> {
+        Ok(conn
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?)
+    };
+    let total: u64 = conn.query_row("SELECT COUNT(*) FROM parallels", [], |r| r.get(0))?;
+    let texts: u64 = conn.query_row(
+        "SELECT COUNT(DISTINCT cbeta_id) FROM parallels WHERE cbeta_id IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT foreign_lang, COUNT(*) FROM parallels GROUP BY foreign_lang ORDER BY foreign_lang",
+    )?;
+    let by_lang = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(DatasetStats {
+        version: meta_get("version")?,
+        license: meta_get("license")?,
+        attribution: meta_get("attribution")?,
+        total,
+        by_lang,
+        texts,
+    })
+}

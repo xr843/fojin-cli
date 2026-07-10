@@ -116,3 +116,124 @@ fn empty_query_returns_empty() {
     let conn = fixture();
     assert!(search(&conn, "", None, 3).unwrap().is_empty());
 }
+
+fn cite_fixture() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let rows = [
+        (
+            "觀自在菩薩",
+            "观自在菩萨",
+            "sa",
+            "āryāvalokiteśvaro",
+            0.95,
+            "T0251",
+            "心經",
+            1,
+        ),
+        (
+            "色即是空",
+            "色即是空",
+            "sa",
+            "rūpaṃ śūnyatā",
+            0.91,
+            "T0251",
+            "心經",
+            2,
+        ),
+        (
+            "色即是空",
+            "色即是空",
+            "bo",
+            "gzugs stong pa",
+            0.88,
+            "T0251",
+            "心經",
+            2,
+        ),
+        (
+            "如是我聞",
+            "如是我闻",
+            "sa",
+            "evaṃ mayā śrutam",
+            0.90,
+            "T0235",
+            "金剛經",
+            1,
+        ),
+    ];
+    for (zt, zn, lang, f, c, cb, ti, j) in rows {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![zt, zn, lang, f, c, cb, ti, j],
+        ).unwrap();
+    }
+    for (from, to) in [("經", "经"), ("剛", "刚")] {
+        conn.execute(
+            "INSERT INTO norm_map(from_char,to_char) VALUES (?1,?2)",
+            params![from, to],
+        )
+        .unwrap();
+    }
+    conn
+}
+
+#[test]
+fn by_cbeta_lists_only_that_text_in_juan_order() {
+    let conn = cite_fixture();
+    let g = fojin_cli::query::by_cbeta(&conn, "T0251", None, None, 3).unwrap();
+    assert_eq!(g.len(), 2);
+    assert_eq!(g[0].zh_text, "觀自在菩薩");
+    assert_eq!(g[0].juan_num, Some(1));
+    assert_eq!(g[1].zh_text, "色即是空");
+    assert_eq!(g[1].parallels.len(), 2, "sa+bo grouped");
+}
+
+#[test]
+fn by_cbeta_filters_juan_and_is_case_insensitive() {
+    let conn = cite_fixture();
+    let g = fojin_cli::query::by_cbeta(&conn, "t0251", Some(2), None, 3).unwrap();
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].juan_num, Some(2));
+}
+
+#[test]
+fn by_cbeta_unknown_id_is_empty_not_error() {
+    let conn = cite_fixture();
+    assert!(fojin_cli::query::by_cbeta(&conn, "T9999", None, None, 3)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn texts_matching_folds_traditional_titles() {
+    let conn = cite_fixture();
+    let map = fojin_cli::normalize::load_norm_map(&conn).unwrap();
+    let hits = fojin_cli::query::texts_matching(&conn, "心经", &map).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].cbeta_id, "T0251");
+    assert_eq!(
+        hits[0].title_zh, "心經",
+        "displays original traditional title"
+    );
+}
+
+#[test]
+fn texts_matching_counts_per_lang() {
+    let conn = cite_fixture();
+    let map = fojin_cli::normalize::load_norm_map(&conn).unwrap();
+    let hits = fojin_cli::query::texts_matching(&conn, "心经", &map).unwrap();
+    let by_lang = &hits[0].by_lang;
+    assert_eq!(by_lang.iter().find(|(l, _)| l == "sa").unwrap().1, 2);
+    assert_eq!(by_lang.iter().find(|(l, _)| l == "bo").unwrap().1, 1);
+}
+
+#[test]
+fn texts_matching_no_hit_is_empty() {
+    let conn = cite_fixture();
+    let map = fojin_cli::normalize::load_norm_map(&conn).unwrap();
+    assert!(fojin_cli::query::texts_matching(&conn, "法华", &map)
+        .unwrap()
+        .is_empty());
+}

@@ -79,3 +79,135 @@ fn zero_limit_is_rejected_during_clap_parsing_before_data_access() {
     assert!(stderr.contains("1.."));
     assert!(!stderr.contains("本地数据不存在"));
 }
+
+fn write_fixture_db(dir: &std::path::Path) {
+    let conn = Connection::open(dir.join("data.sqlite")).unwrap();
+    init_schema(&conn).unwrap();
+    for (k, v) in [("version", "v1"), ("license", "CC BY-SA 4.0")] {
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES (?1,?2)",
+            rusqlite::params![k, v],
+        )
+        .unwrap();
+    }
+    let rows = [
+        (
+            "觀自在菩薩",
+            "观自在菩萨",
+            "sa",
+            "āryāvalokiteśvaro",
+            0.95,
+            "T0251",
+            "般若波羅蜜多心經",
+            1,
+        ),
+        (
+            "色即是空",
+            "色即是空",
+            "sa",
+            "rūpaṃ śūnyatā",
+            0.91,
+            "T0251",
+            "般若波羅蜜多心經",
+            1,
+        ),
+        (
+            "色即是空",
+            "色即是空",
+            "bo",
+            "gzugs stong pa",
+            0.88,
+            "T0251",
+            "般若波羅蜜多心經",
+            1,
+        ),
+    ];
+    for (zt, zn, lang, f, c, cb, ti, j) in rows {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![zt, zn, lang, f, c, cb, ti, j],
+        ).unwrap();
+    }
+    for (from, to) in [("經", "经"), ("觀", "观")] {
+        conn.execute(
+            "INSERT INTO norm_map(from_char,to_char) VALUES (?1,?2)",
+            rusqlite::params![from, to],
+        )
+        .unwrap();
+    }
+}
+
+fn run_fojin(args: &[&str], dir: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(args)
+        .args(["--data-dir"])
+        .arg(dir)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn data_status_json_reports_dataset() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_db(dir.path());
+    let out = run_fojin(&["data", "status", "--json"], dir.path());
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("\"version\": \"v1\""), "got: {stdout}");
+    assert!(stdout.contains("\"total\": 3"), "got: {stdout}");
+    assert!(stdout.contains("\"exists\": true"), "got: {stdout}");
+}
+
+#[test]
+fn data_status_reports_missing_data_without_downloading() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_fojin(&["data", "status"], dir.path());
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("未下载"), "got: {stdout}");
+}
+
+#[test]
+fn data_clean_removes_file_and_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_db(dir.path());
+    let out = run_fojin(&["data", "clean"], dir.path());
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!dir.path().join("data.sqlite").exists());
+    let out2 = run_fojin(&["data", "clean"], dir.path());
+    assert_eq!(out2.status.code(), Some(0));
+    assert!(String::from_utf8(out2.stdout).unwrap().contains("无数据"));
+}
+
+#[test]
+fn texts_finds_title_via_simplified_keyword() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_db(dir.path());
+    let out = run_fojin(&["texts", "心经", "--offline"], dir.path());
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("T0251"), "got: {stdout}");
+    assert!(stdout.contains("般若波羅蜜多心經"), "got: {stdout}");
+}
+
+#[test]
+fn cite_lists_text_groups_as_json() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_db(dir.path());
+    let out = run_fojin(&["cite", "T0251", "--json", "--offline"], dir.path());
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("觀自在菩薩"), "got: {stdout}");
+    assert!(stdout.contains("\"total\": 2"), "got: {stdout}");
+}
+
+#[test]
+fn cite_unknown_id_suggests_texts_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_db(dir.path());
+    let out = run_fojin(&["cite", "T9999", "--offline"], dir.path());
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("fojin texts"), "got: {stdout}");
+}

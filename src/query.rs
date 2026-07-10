@@ -142,6 +142,135 @@ fn group_and_rank(
     ranked.into_iter().map(|(_, _, g)| g).collect()
 }
 
+/// List a text's aligned groups by Taishō id (case-insensitive), optionally
+/// filtered to one juan, in juan-then-insertion order (canonical text order,
+/// not relevance order — this is a browse, not a search).
+pub fn by_cbeta(
+    conn: &Connection,
+    cbeta_id: &str,
+    juan: Option<i64>,
+    langs: Option<&[String]>,
+    top: usize,
+) -> rusqlite::Result<Vec<MatchGroup>> {
+    let mut sql = String::from(
+        "SELECT zh_text,zh_norm,foreign_lang,foreign_text,confidence,\
+                cbeta_id,title_zh,juan_num \
+         FROM parallels WHERE cbeta_id = ?1 COLLATE NOCASE",
+    );
+    if juan.is_some() {
+        sql.push_str(" AND juan_num = ?2");
+    }
+    sql.push_str(" ORDER BY juan_num, id");
+    let mut stmt = conn.prepare(&sql)?;
+    let map_row = |r: &rusqlite::Row| {
+        Ok(Row {
+            zh_text: r.get(0)?,
+            zh_norm: r.get(1)?,
+            foreign_lang: r.get(2)?,
+            foreign_text: r.get(3)?,
+            confidence: r.get(4)?,
+            cbeta_id: r.get(5)?,
+            title_zh: r.get(6)?,
+            juan_num: r.get(7)?,
+        })
+    };
+    let rows: Vec<Row> = if let Some(j) = juan {
+        stmt.query_map(rusqlite::params![cbeta_id, j], map_row)?
+            .collect::<rusqlite::Result<_>>()?
+    } else {
+        stmt.query_map([cbeta_id], map_row)?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    // Group in encounter order (already canonical from ORDER BY).
+    let mut groups: Vec<MatchGroup> = Vec::new();
+    for row in rows {
+        if let Some(filter) = langs {
+            if !filter.iter().any(|l| l == &row.foreign_lang) {
+                continue;
+            }
+        }
+        let idx = groups.iter().position(|g| {
+            g.zh_text == row.zh_text && g.cbeta_id == row.cbeta_id && g.juan_num == row.juan_num
+        });
+        let idx = match idx {
+            Some(i) => i,
+            None => {
+                groups.push(MatchGroup {
+                    zh_text: row.zh_text.clone(),
+                    cbeta_id: row.cbeta_id.clone(),
+                    title_zh: row.title_zh.clone(),
+                    juan_num: row.juan_num,
+                    parallels: Vec::new(),
+                });
+                groups.len() - 1
+            }
+        };
+        groups[idx].parallels.push(Parallel {
+            lang: row.foreign_lang,
+            text: row.foreign_text,
+            confidence: row.confidence,
+        });
+    }
+    for g in &mut groups {
+        g.parallels = cap_per_lang(std::mem::take(&mut g.parallels), top);
+    }
+    Ok(groups)
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct TextEntry {
+    pub cbeta_id: String,
+    pub title_zh: String,
+    /// (lang, aligned-segment count) sorted by lang code
+    pub by_lang: Vec<(String, u64)>,
+}
+
+/// Fuzzy title search: normalizes both the stored (traditional) titles and the
+/// caller-normalized keyword, then substring-matches. The distinct-title list
+/// is small (~1k rows), so folding in Rust is cheap.
+pub fn texts_matching(
+    conn: &Connection,
+    norm_keyword: &str,
+    map: &crate::normalize::NormMap,
+) -> rusqlite::Result<Vec<TextEntry>> {
+    if norm_keyword.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT cbeta_id, title_zh, foreign_lang, COUNT(*) FROM parallels \
+         WHERE cbeta_id IS NOT NULL AND title_zh IS NOT NULL \
+         GROUP BY cbeta_id, title_zh, foreign_lang ORDER BY cbeta_id, foreign_lang",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, u64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out: Vec<TextEntry> = Vec::new();
+    for (cbeta_id, title_zh, lang, count) in rows {
+        if !crate::normalize::normalize(&title_zh, map).contains(norm_keyword) {
+            continue;
+        }
+        match out
+            .iter_mut()
+            .find(|e| e.cbeta_id == cbeta_id && e.title_zh == title_zh)
+        {
+            Some(e) => e.by_lang.push((lang, count)),
+            None => out.push(TextEntry {
+                cbeta_id,
+                title_zh,
+                by_lang: vec![(lang, count)],
+            }),
+        }
+    }
+    Ok(out)
+}
+
 fn cap_per_lang(parallels: Vec<Parallel>, top: usize) -> Vec<Parallel> {
     let mut by_lang: BTreeMap<String, Vec<Parallel>> = BTreeMap::new();
     for p in parallels {

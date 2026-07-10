@@ -54,6 +54,87 @@ pub enum Command {
         #[arg(long)]
         offline: bool,
     },
+    /// 本地数据管理:状态 / 清理 / 重新下载
+    Data {
+        #[command(subcommand)]
+        action: DataAction,
+    },
+    /// 按经名关键词搜索收录文本(简繁均可)
+    Texts {
+        /// 经名关键词,如 "心经"
+        keyword: String,
+        /// 机器可读 JSON 输出
+        #[arg(long)]
+        json: bool,
+        /// 指定数据目录(覆盖默认缓存)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// 不联网;缺数据则报错
+        #[arg(long)]
+        offline: bool,
+    },
+    /// 按 Taishō 编号列出某经的对齐(经文顺序,非相关度排序)
+    Cite {
+        /// Taishō 编号,如 T0251(大小写不敏感)
+        cbeta_id: String,
+        /// 只看某一卷
+        #[arg(long)]
+        juan: Option<i64>,
+        /// 只看某些语种,逗号分隔,如 sa,bo
+        #[arg(long)]
+        lang: Option<String>,
+        /// 每语最多 N 条
+        #[arg(
+            long,
+            default_value_t = 3,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+        )]
+        top: usize,
+        /// 最多显示 N 组
+        #[arg(
+            long,
+            default_value_t = 10,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+        )]
+        limit: usize,
+        /// 显示全部匹配组,忽略 --limit
+        #[arg(long)]
+        all: bool,
+        /// 机器可读 JSON 输出
+        #[arg(long)]
+        json: bool,
+        /// 指定数据目录(覆盖默认缓存)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// 不联网;缺数据则报错
+        #[arg(long)]
+        offline: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DataAction {
+    /// 显示本地数据状态(不触发下载)
+    Status {
+        /// 机器可读 JSON 输出
+        #[arg(long)]
+        json: bool,
+        /// 指定数据目录(覆盖默认缓存)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// 删除本地数据,释放空间(下次在线运行会重新下载)
+    Clean {
+        /// 指定数据目录(覆盖默认缓存)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// 重新下载数据,覆盖本地副本
+    Update {
+        /// 指定数据目录(覆盖默认缓存)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 pub fn compute_output(
@@ -128,6 +209,161 @@ pub fn run() -> Result<i32> {
             let limit = if all { None } else { Some(limit_flag) };
             let out = compute_output(&conn, &raw, langs.as_deref(), top, limit, json)?;
             println!("{out}");
+            Ok(0)
+        }
+        Command::Data { action } => run_data(action),
+        Command::Texts {
+            keyword,
+            json,
+            data_dir,
+            offline,
+        } => {
+            if keyword.trim().is_empty() {
+                eprintln!("用法: fojin texts \"心经\"");
+                return Ok(2);
+            }
+            let conn = open_ensured(data_dir, offline)?;
+            let map = normalize::load_norm_map(&conn)?;
+            let norm_kw = normalize::normalize(keyword.trim(), &map);
+            let hits = query::texts_matching(&conn, &norm_kw, &map)?;
+            if json {
+                let v = serde_json::json!({ "total": hits.len(), "texts": hits });
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!("{}", render::render_texts(&hits));
+            }
+            Ok(0)
+        }
+        Command::Cite {
+            cbeta_id,
+            juan,
+            lang,
+            top,
+            limit: limit_flag,
+            all,
+            json,
+            data_dir,
+            offline,
+        } => {
+            let conn = open_ensured(data_dir, offline)?;
+            let langs: Option<Vec<String>> = lang.map(|l| {
+                l.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            });
+            let groups_all = query::by_cbeta(&conn, cbeta_id.trim(), juan, langs.as_deref(), top)?;
+            let total = groups_all.len();
+            if total == 0 && !json {
+                let juan_hint = juan.map(|j| format!(" 卷{j}")).unwrap_or_default();
+                println!(
+                    "未找到 {}{} 的对齐。可用 fojin texts <经名关键词> 查询收录文本。",
+                    cbeta_id.trim(),
+                    juan_hint
+                );
+                return Ok(0);
+            }
+            let shown = if all { total } else { limit_flag.min(total) };
+            let hidden = total - shown;
+            let out = if json {
+                render::render_json(&groups_all[..shown], total)
+            } else {
+                render::render_human(&groups_all[..shown], langs.as_deref(), hidden)
+            };
+            println!("{out}");
+            Ok(0)
+        }
+    }
+}
+
+/// Resolve the data path, ensure the dataset is present (downloading unless
+/// offline), and open it.
+fn open_ensured(data_dir: Option<PathBuf>, offline: bool) -> Result<Connection> {
+    let path = data::resolve_data_path(data_dir)?;
+    data::ensure_data(
+        &path,
+        offline,
+        &data::DataSource {
+            url: DATA_URL,
+            sha256: DATA_SHA256,
+        },
+    )?;
+    data::open_db(&path)
+}
+
+fn run_data(action: DataAction) -> Result<i32> {
+    const MB: u64 = 1024 * 1024;
+    match action {
+        DataAction::Status { json, data_dir } => {
+            let path = data::resolve_data_path(data_dir)?;
+            let exists = path.exists();
+            let size_bytes = if exists {
+                Some(std::fs::metadata(&path)?.len())
+            } else {
+                None
+            };
+            let stats = if exists {
+                Some(data::dataset_stats(&data::open_db(&path)?)?)
+            } else {
+                None
+            };
+            if json {
+                let by_lang: serde_json::Map<String, serde_json::Value> = stats
+                    .as_ref()
+                    .map(|s| {
+                        s.by_lang
+                            .iter()
+                            .map(|(l, c)| (l.clone(), serde_json::json!(c)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let v = serde_json::json!({
+                    "path": path.display().to_string(),
+                    "exists": exists,
+                    "size_bytes": size_bytes,
+                    "version": stats.as_ref().and_then(|s| s.version.clone()),
+                    "license": stats.as_ref().and_then(|s| s.license.clone()),
+                    "attribution": stats.as_ref().and_then(|s| s.attribution.clone()),
+                    "total": stats.as_ref().map(|s| s.total),
+                    "by_lang": by_lang,
+                    "texts": stats.as_ref().map(|s| s.texts),
+                });
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!(
+                    "{}",
+                    render::render_status(&path.display().to_string(), size_bytes, stats.as_ref())
+                );
+            }
+            Ok(0)
+        }
+        DataAction::Clean { data_dir } => {
+            let path = data::resolve_data_path(data_dir)?;
+            // A crashed download can leave a temp sibling; sweep it too.
+            let _ = std::fs::remove_file(path.with_extension("tmp"));
+            if path.exists() {
+                let size = std::fs::metadata(&path)?.len();
+                std::fs::remove_file(&path)?;
+                println!("已删除 {} (释放 {} MB)", path.display(), size / MB);
+            } else {
+                println!("本地无数据,无需清理: {}", path.display());
+            }
+            Ok(0)
+        }
+        DataAction::Update { data_dir } => {
+            let path = data::resolve_data_path(data_dir)?;
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+            data::ensure_data(
+                &path,
+                false,
+                &data::DataSource {
+                    url: DATA_URL,
+                    sha256: DATA_SHA256,
+                },
+            )?;
+            println!("数据已更新: {}", path.display());
             Ok(0)
         }
     }

@@ -74,6 +74,88 @@ pub fn render_human(groups: &[MatchGroup], langs: Option<&[String]>, hidden: usi
     out
 }
 
+fn group_digits(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+pub fn render_texts(entries: &[crate::query::TextEntry]) -> String {
+    if entries.is_empty() {
+        return "未找到匹配的经名\n".to_string();
+    }
+    let mut out = String::new();
+    for e in entries {
+        let counts: Vec<String> = e
+            .by_lang
+            .iter()
+            .map(|(l, c)| format!("{} {}", lang_label(l), group_digits(*c)))
+            .collect();
+        out.push_str(&format!(
+            "{}  {}  ({})\n",
+            e.cbeta_id,
+            e.title_zh,
+            counts.join(" · ")
+        ));
+    }
+    out.push_str(&format!(
+        "\n共 {} 部;用 fojin cite <编号> 查看对齐\n",
+        entries.len()
+    ));
+    out
+}
+
+pub fn render_status(
+    path: &str,
+    size_bytes: Option<u64>,
+    stats: Option<&crate::data::DatasetStats>,
+) -> String {
+    const MB: u64 = 1024 * 1024;
+    let mut out = String::new();
+    out.push_str(&format!("数据位置  {path}\n"));
+    match (size_bytes, stats) {
+        (Some(size), Some(s)) => {
+            out.push_str(&format!("状态      已下载 ({} MB)\n", size / MB));
+            let about: Vec<String> = [
+                s.version.as_deref(),
+                s.license.as_deref(),
+                s.attribution.as_deref(),
+            ]
+            .iter()
+            .flatten()
+            .map(|v| v.to_string())
+            .collect();
+            if !about.is_empty() {
+                out.push_str(&format!("数据版本  {}\n", about.join(" · ")));
+            }
+            out.push_str(&format!("对齐总数  {}\n", group_digits(s.total)));
+            for (lang, count) in &s.by_lang {
+                out.push_str(&format!(
+                    "  {} {}   {}\n",
+                    lang_label(lang),
+                    lang,
+                    group_digits(*count)
+                ));
+            }
+            out.push_str(&format!(
+                "收录文本  {} 部 (Taishō)\n",
+                group_digits(s.texts)
+            ));
+        }
+        _ => {
+            out.push_str("状态      未下载\n");
+            out.push_str("提示      运行 fojin parallel \"...\" 或 fojin data update 下载数据\n");
+        }
+    }
+    out
+}
+
 pub fn render_json(groups: &[MatchGroup], total: usize) -> String {
     let v = serde_json::json!({
         "matched": total > 0,

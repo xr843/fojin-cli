@@ -144,3 +144,33 @@ fn ensure_data_downloads_verifies_and_unpacks() {
         "temp file must not linger"
     );
 }
+
+#[test]
+fn dataset_stats_reads_meta_and_counts() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    fojin_cli::schema::init_schema(&conn).unwrap();
+    for (k, v) in [("version", "v1"), ("license", "CC BY-SA 4.0")] {
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES (?1,?2)",
+            rusqlite::params![k, v],
+        )
+        .unwrap();
+    }
+    for (lang, cb) in [("sa", "T0251"), ("sa", "T0235"), ("bo", "T0251")] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,cbeta_id)
+             VALUES ('色','色',?1,'x',?2)",
+            rusqlite::params![lang, cb],
+        )
+        .unwrap();
+    }
+    let s = fojin_cli::data::dataset_stats(&conn).unwrap();
+    assert_eq!(s.version.as_deref(), Some("v1"));
+    assert_eq!(s.license.as_deref(), Some("CC BY-SA 4.0"));
+    assert_eq!(s.total, 3);
+    assert_eq!(s.texts, 2);
+    assert_eq!(
+        s.by_lang,
+        vec![("bo".to_string(), 1), ("sa".to_string(), 2)]
+    );
+}
