@@ -46,6 +46,11 @@ fn rejects_single_character_query() {
 }
 
 #[test]
+fn accepts_empty_normalized_query() {
+    assert!(fojin_cli::normalize::validate_query_length("").is_ok());
+}
+
+#[test]
 fn accepts_two_character_query() {
     assert!(fojin_cli::normalize::validate_query_length("般若").is_ok());
 }

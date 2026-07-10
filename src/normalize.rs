@@ -18,7 +18,7 @@ pub fn normalize(input: &str, map: &NormMap) -> String {
 
 pub fn validate_query_length(normalized: &str) -> Result<()> {
     let count = normalized.chars().count();
-    if count < MIN_QUERY_CHARS {
+    if count == 1 {
         bail!("查询至少需要 2 个汉字；一字查询范围过大，请输入更具体的词句");
     }
     Ok(())
