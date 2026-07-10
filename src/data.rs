@@ -115,6 +115,44 @@ pub fn ensure_data(path: &Path, offline: bool, source: &DataSource) -> Result<()
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("创建缓存目录失败")?;
     }
+    let raw = download_and_unpack(path, source)?;
+    write_atomic(path, &raw)
+}
+
+/// Download a replacement dataset to a sibling candidate, validate it, then
+/// replace the live dataset. Failures before replacement leave `path` intact.
+pub fn update_data(path: &Path, source: &DataSource) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("创建缓存目录失败")?;
+    }
+
+    let candidate = sibling_path(path, ".candidate")?;
+    remove_candidate_artifacts(&candidate)?;
+
+    let result = (|| {
+        let raw = download_and_unpack(path, source)?;
+        std::fs::write(&candidate, raw)
+            .with_context(|| format!("写入候选数据失败: {}", candidate.display()))?;
+
+        let conn = open_read_only_db(&candidate)?;
+        verify_dataset(&conn)?;
+        drop(conn);
+
+        replace_with_candidate(path, &candidate)
+    })();
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Err(cleanup_error) = remove_candidate_artifacts(&candidate) {
+                return Err(error.context(format!("清理候选数据失败: {cleanup_error}")));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn download_and_unpack(path: &Path, source: &DataSource) -> Result<Vec<u8>> {
     let gz = http_get(source.url).map_err(|e| {
         anyhow!(
             "{e:#}\n请手动下载:\n  {}\n解压后放到: {}",
@@ -129,8 +167,88 @@ pub fn ensure_data(path: &Path, offline: bool, source: &DataSource) -> Result<()
             path.display()
         ));
     }
-    let raw = gunzip(&gz)?;
-    write_atomic(path, &raw)?;
+    gunzip(&gz)
+}
+
+fn sibling_path(path: &Path, suffix: &str) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("数据路径没有文件名: {}", path.display()))?;
+    let mut sibling = file_name.to_os_string();
+    sibling.push(suffix);
+    Ok(path.with_file_name(sibling))
+}
+
+fn remove_candidate_artifacts(candidate: &Path) -> Result<()> {
+    for suffix in ["", "-journal", "-shm", "-wal"] {
+        let artifact = if suffix.is_empty() {
+            candidate.to_path_buf()
+        } else {
+            sibling_path(candidate, suffix)?
+        };
+        match std::fs::remove_file(&artifact) {
+            Ok(()) => {}
+            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("删除候选数据失败: {}", artifact.display()))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn replace_with_candidate(path: &Path, candidate: &Path) -> Result<()> {
+    if !path.exists() {
+        return std::fs::rename(candidate, path).with_context(|| {
+            format!(
+                "替换数据文件失败: {} -> {}",
+                candidate.display(),
+                path.display()
+            )
+        });
+    }
+
+    // Windows does not allow rename to replace an existing destination. Move
+    // the live file aside first, then restore it if moving the candidate fails.
+    let backup = sibling_path(path, ".backup")?;
+    match std::fs::remove_file(&backup) {
+        Ok(()) => {}
+        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("删除旧备份失败: {}", backup.display()))
+        }
+    }
+    std::fs::rename(path, &backup).with_context(|| {
+        format!(
+            "准备替换数据文件失败: {} -> {}",
+            path.display(),
+            backup.display()
+        )
+    })?;
+
+    if let Err(replace_error) = std::fs::rename(candidate, path) {
+        return match std::fs::rename(&backup, path) {
+            Ok(()) => Err(replace_error).with_context(|| {
+                format!(
+                    "替换数据文件失败: {} -> {}",
+                    candidate.display(),
+                    path.display()
+                )
+            }),
+            Err(restore_error) => Err(anyhow!(
+                "替换数据文件失败: {} -> {}; 恢复原数据失败: {} -> {}: {}",
+                candidate.display(),
+                path.display(),
+                backup.display(),
+                path.display(),
+                restore_error
+            )),
+        };
+    }
+
+    std::fs::remove_file(&backup)
+        .with_context(|| format!("删除旧数据备份失败: {}", backup.display()))?;
     Ok(())
 }
 
@@ -190,6 +308,7 @@ pub fn validate_compatibility(conn: &rusqlite::Connection) -> Result<DatasetComp
         "parallels_fts",
         "SELECT rowid, zh_norm FROM parallels_fts LIMIT 0",
     )?;
+    require_trigram_fts(conn)?;
     require_schema(
         conn,
         "norm_map",
@@ -293,6 +412,44 @@ fn require_schema(conn: &rusqlite::Connection, name: &str, sql: &str) -> Result<
             "dataset incompatibility: required schema `{name}` is missing or invalid: {e}. Run `fojin data update`."
         )
     })
+}
+
+fn require_trigram_fts(conn: &rusqlite::Connection) -> Result<()> {
+    let _: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM parallels_fts WHERE parallels_fts MATCH ?1 LIMIT 1",
+            ["x"],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| {
+            anyhow!(
+                "dataset incompatibility: required schema `parallels_fts` does not support FTS5 MATCH: {e}. Run `fojin data update`."
+            )
+        })?;
+
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'parallels_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            anyhow!(
+                "dataset incompatibility: required schema `parallels_fts` has no table declaration: {e}. Run `fojin data update`."
+            )
+        })?;
+    let declaration: String = sql
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if !declaration.contains("usingfts5(") || !declaration.contains("tokenize='trigram'") {
+        return Err(anyhow!(
+            "dataset incompatibility: required schema `parallels_fts` must be an FTS5 table with tokenize='trigram'. Run `fojin data update`."
+        ));
+    }
+    Ok(())
 }
 
 fn require_expected_meta(conn: &rusqlite::Connection, key: &str, expected: &str) -> Result<String> {

@@ -1,5 +1,5 @@
 use fojin_cli::data::{
-    ensure_data, gunzip, open_compatible_db, open_read_only_db, resolve_data_path,
+    ensure_data, gunzip, open_compatible_db, open_read_only_db, resolve_data_path, update_data,
     validate_compatibility, verify_dataset, verify_sha256, DataSource, EXPECTED_DATA_VERSION,
     EXPECTED_NORM_RULESET,
 };
@@ -259,6 +259,35 @@ fn compatibility_rejects_missing_parallels_fts() {
 }
 
 #[test]
+fn compatibility_rejects_parallels_fts_lookalike_table() {
+    let conn = compatible_conn();
+    conn.execute("DROP TABLE parallels_fts", []).unwrap();
+    conn.execute("CREATE TABLE parallels_fts (zh_norm TEXT NOT NULL)", [])
+        .unwrap();
+
+    let err = validate_compatibility(&conn).unwrap_err().to_string();
+
+    assert!(err.contains("parallels_fts"), "got: {err}");
+    assert!(err.contains("fojin data update"), "got: {err}");
+}
+
+#[test]
+fn compatibility_rejects_non_trigram_parallels_fts() {
+    let conn = compatible_conn();
+    conn.execute("DROP TABLE parallels_fts", []).unwrap();
+    conn.execute(
+        "CREATE VIRTUAL TABLE parallels_fts USING fts5(zh_norm, content='parallels', content_rowid='id')",
+        [],
+    )
+    .unwrap();
+
+    let err = validate_compatibility(&conn).unwrap_err().to_string();
+
+    assert!(err.contains("parallels_fts"), "got: {err}");
+    assert!(err.contains("fojin data update"), "got: {err}");
+}
+
+#[test]
 fn compatibility_rejects_missing_query_required_parallels_column() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(
@@ -326,6 +355,98 @@ fn verify_dataset_accepts_compatible_read_only_db() {
 
     assert_eq!(got.version, EXPECTED_DATA_VERSION);
     assert_eq!(got.norm_ruleset, EXPECTED_NORM_RULESET);
+}
+
+#[test]
+fn verify_dataset_rejects_quick_check_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    fojin_cli::schema::init_schema(&conn).unwrap();
+    insert_compat_meta(&conn);
+    conn.execute("CREATE TABLE quick_check_probe (value TEXT)", [])
+        .unwrap();
+    let meta_rootpage: i64 = conn
+        .query_row(
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'meta'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute_batch("PRAGMA writable_schema = ON").unwrap();
+    conn.execute(
+        "UPDATE sqlite_schema SET rootpage = ?1 WHERE name = 'quick_check_probe'",
+        [meta_rootpage],
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA writable_schema = OFF").unwrap();
+    drop(conn);
+
+    let conn = open_read_only_db(&path).unwrap();
+    let err = verify_dataset(&conn).unwrap_err().to_string();
+
+    assert!(err.contains("PRAGMA quick_check failed"), "got: {err}");
+    assert!(err.contains("2nd reference to page"), "got: {err}");
+}
+
+#[test]
+fn update_data_preserves_live_dataset_when_candidate_fails_compatibility() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    std::fs::write(&path, b"live dataset").unwrap();
+
+    let source_path = dir.path().join("candidate.sqlite");
+    let conn = rusqlite::Connection::open(&source_path).unwrap();
+    fojin_cli::schema::init_schema(&conn).unwrap();
+    insert_compat_meta(&conn);
+    conn.execute("UPDATE meta SET value = 'v0' WHERE key = 'version'", [])
+        .unwrap();
+    drop(conn);
+
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(&std::fs::read(&source_path).unwrap())
+        .unwrap();
+    let gz = enc.finish().unwrap();
+    std::fs::remove_file(&source_path).unwrap();
+
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(&gz);
+    let sha: String = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let _ = std::io::Read::read(&mut stream, &mut request);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            gz.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&gz).unwrap();
+    });
+    let source_url = format!("http://127.0.0.1:{port}/data.gz");
+    let source = DataSource {
+        url: &source_url,
+        sha256: &sha,
+    };
+
+    let err = update_data(&path, &source).unwrap_err().to_string();
+    server.join().unwrap();
+
+    assert!(err.contains("dataset incompatibility"), "got: {err}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"live dataset");
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, vec![std::ffi::OsString::from("data.sqlite")]);
 }
 
 fn compatible_conn() -> rusqlite::Connection {

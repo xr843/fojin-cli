@@ -27,7 +27,7 @@ $ fojin parallel "色即是空"
 通过 [crates.io](https://crates.io/crates/fojin-cli) 安装(命令为 `fojin`）：
 
 ```bash
-cargo install fojin-cli
+cargo install fojin-cli --locked
 ```
 
 没有 Rust 环境?一行脚本自动安装对应平台的预编译二进制(Linux x64 / macOS ARM+Intel)：
@@ -39,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/xr843/fojin-cli/master/install.sh |
 也可从 [Releases](https://github.com/xr843/fojin-cli/releases/latest) 手动下载各平台二进制(含 Windows x64 zip),或从源码安装：
 
 ```bash
-cargo install --git https://github.com/xr843/fojin-cli
+cargo install --git https://github.com/xr843/fojin-cli --locked
 ```
 
 首次运行 `fojin parallel` 会自动下载对齐数据集(约 183 MB,带进度显示,见下方「数据集」),之后完全离线。

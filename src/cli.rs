@@ -352,18 +352,13 @@ fn run_data(action: DataAction) -> Result<i32> {
         }
         DataAction::Update { data_dir } => {
             let path = data::resolve_data_path(data_dir)?;
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-            }
-            data::ensure_data(
+            data::update_data(
                 &path,
-                false,
                 &data::DataSource {
                     url: DATA_URL,
                     sha256: DATA_SHA256,
                 },
             )?;
-            let _ = data::open_compatible_db(&path)?;
             println!("数据已更新: {}", path.display());
             Ok(0)
         }
