@@ -288,6 +288,43 @@ fn compatibility_rejects_non_trigram_parallels_fts() {
 }
 
 #[test]
+fn compatibility_rejects_default_tokenizer_fts_spoofing_trigram_declaration() {
+    let conn = compatible_conn();
+    conn.execute("DROP TABLE parallels_fts", []).unwrap();
+    conn.execute(
+        "CREATE VIRTUAL TABLE parallels_fts USING fts5(
+             zh_norm,
+             \"tokenize='trigram'\",
+             content='parallels',
+             content_rowid='id'
+         )",
+        [],
+    )
+    .unwrap();
+
+    let err = validate_compatibility(&conn).unwrap_err().to_string();
+
+    assert!(err.contains("parallels_fts"), "got: {err}");
+    assert!(err.contains("fojin data update"), "got: {err}");
+}
+
+#[test]
+fn compatibility_rejects_parallels_fts_view_lookalike() {
+    let conn = compatible_conn();
+    conn.execute("DROP TABLE parallels_fts", []).unwrap();
+    conn.execute(
+        "CREATE VIEW parallels_fts AS SELECT id AS rowid, zh_norm FROM parallels",
+        [],
+    )
+    .unwrap();
+
+    let err = validate_compatibility(&conn).unwrap_err().to_string();
+
+    assert!(err.contains("parallels_fts"), "got: {err}");
+    assert!(err.contains("fojin data update"), "got: {err}");
+}
+
+#[test]
 fn compatibility_rejects_missing_query_required_parallels_column() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(
@@ -447,6 +484,277 @@ fn update_data_preserves_live_dataset_when_candidate_fails_compatibility() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(entries, vec![std::ffi::OsString::from("data.sqlite")]);
+}
+
+#[test]
+fn update_data_replaces_valid_existing_dataset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    std::fs::write(&path, b"old live dataset").unwrap();
+    let gz = gzip_bytes(&replacement_database_bytes());
+    let sha = sha256_hex(&gz);
+
+    serve_update(&path, gz, &sha).unwrap();
+
+    assert_replacement_marker(&path);
+    assert_no_candidate_artifacts(&path);
+}
+
+#[test]
+fn update_data_installs_valid_dataset_when_target_is_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    let gz = gzip_bytes(&replacement_database_bytes());
+    let sha = sha256_hex(&gz);
+
+    serve_update(&path, gz, &sha).unwrap();
+
+    assert_replacement_marker(&path);
+    assert_no_candidate_artifacts(&path);
+}
+
+#[test]
+fn update_data_preserves_live_dataset_on_download_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    std::fs::write(&path, b"old live dataset").unwrap();
+
+    let err = serve_update_response(
+        &path,
+        "500 Internal Server Error",
+        b"download failed".to_vec(),
+        "unused",
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("下载失败"), "got: {err}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old live dataset");
+    assert_no_candidate_artifacts(&path);
+}
+
+#[test]
+fn update_data_preserves_live_dataset_on_checksum_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    std::fs::write(&path, b"old live dataset").unwrap();
+    let gz = gzip_bytes(&replacement_database_bytes());
+
+    let err = serve_update(&path, gz, &"0".repeat(64))
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("sha256"), "got: {err}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old live dataset");
+    assert_no_candidate_artifacts(&path);
+}
+
+#[test]
+fn update_data_preserves_live_dataset_on_decompression_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    std::fs::write(&path, b"old live dataset").unwrap();
+    let invalid_gzip = b"not gzip data".to_vec();
+    let sha = sha256_hex(&invalid_gzip);
+
+    let err = serve_update(&path, invalid_gzip, &sha)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("解压 gzip 失败"), "got: {err}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old live dataset");
+    assert_no_candidate_artifacts(&path);
+}
+
+#[test]
+fn update_data_preserves_live_dataset_when_candidate_is_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    std::fs::write(&path, b"old live dataset").unwrap();
+    let database = compatible_database_bytes(|conn| {
+        conn.execute("CREATE TABLE quick_check_probe (value TEXT)", [])
+            .unwrap();
+        let meta_rootpage: i64 = conn
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name = 'meta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute_batch("PRAGMA writable_schema = ON").unwrap();
+        conn.execute(
+            "UPDATE sqlite_schema SET rootpage = ?1 WHERE name = 'quick_check_probe'",
+            [meta_rootpage],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA writable_schema = OFF").unwrap();
+    });
+    let gz = gzip_bytes(&database);
+    let sha = sha256_hex(&gz);
+
+    let err = serve_update(&path, gz, &sha).unwrap_err().to_string();
+
+    assert!(err.contains("PRAGMA quick_check failed"), "got: {err}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old live dataset");
+    assert_no_candidate_artifacts(&path);
+}
+
+#[test]
+fn update_data_cleans_stale_candidate_artifacts_on_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    std::fs::write(&path, b"old live dataset").unwrap();
+    let candidate = sibling_path(&path, ".candidate");
+    for suffix in ["", "-journal", "-shm", "-wal"] {
+        std::fs::write(sibling_path(&candidate, suffix), b"stale").unwrap();
+    }
+
+    serve_update_response(
+        &path,
+        "500 Internal Server Error",
+        b"download failed".to_vec(),
+        "unused",
+    )
+    .unwrap_err();
+
+    assert_eq!(std::fs::read(&path).unwrap(), b"old live dataset");
+    assert_no_candidate_artifacts(&path);
+}
+
+#[test]
+fn update_data_replaces_live_dataset_without_backup_path_dependency() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    std::fs::write(&path, b"old live dataset").unwrap();
+    let backup_sentinel = dir.path().join("data.sqlite.backup");
+    std::fs::create_dir(&backup_sentinel).unwrap();
+
+    let database = compatible_database_bytes(|conn| {
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('marker', 'replacement')",
+            [],
+        )
+        .unwrap();
+    });
+    let gz = gzip_bytes(&database);
+    let sha = sha256_hex(&gz);
+
+    serve_update(&path, gz, &sha).unwrap();
+
+    let conn = open_read_only_db(&path).unwrap();
+    verify_dataset(&conn).unwrap();
+    let marker: String = conn
+        .query_row("SELECT value FROM meta WHERE key = 'marker'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(marker, "replacement");
+    assert!(backup_sentinel.is_dir());
+    assert_no_candidate_artifacts(&path);
+}
+
+fn replacement_database_bytes() -> Vec<u8> {
+    compatible_database_bytes(|conn| {
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('marker', 'replacement')",
+            [],
+        )
+        .unwrap();
+    })
+}
+
+fn assert_replacement_marker(path: &std::path::Path) {
+    let conn = open_read_only_db(path).unwrap();
+    verify_dataset(&conn).unwrap();
+    let marker: String = conn
+        .query_row("SELECT value FROM meta WHERE key = 'marker'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(marker, "replacement");
+}
+
+fn assert_no_candidate_artifacts(path: &std::path::Path) {
+    let candidate = sibling_path(path, ".candidate");
+    for suffix in ["", "-journal", "-shm", "-wal"] {
+        let artifact = sibling_path(&candidate, suffix);
+        assert!(
+            !artifact.exists(),
+            "artifact remains: {}",
+            artifact.display()
+        );
+    }
+}
+
+fn sibling_path(path: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+fn compatible_database_bytes(configure: impl FnOnce(&rusqlite::Connection)) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("candidate.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    fojin_cli::schema::init_schema(&conn).unwrap();
+    insert_compat_meta(&conn);
+    configure(&conn);
+    drop(conn);
+    std::fs::read(path).unwrap()
+}
+
+fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(bytes);
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn serve_update(
+    path: &std::path::Path,
+    body: Vec<u8>,
+    expected_sha256: &str,
+) -> anyhow::Result<()> {
+    serve_update_response(path, "200 OK", body, expected_sha256)
+}
+
+fn serve_update_response(
+    path: &std::path::Path,
+    status: &'static str,
+    body: Vec<u8>,
+    expected_sha256: &str,
+) -> anyhow::Result<()> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let _ = std::io::Read::read(&mut stream, &mut request);
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        let _ = stream.write_all(&body);
+    });
+    let source_url = format!("http://127.0.0.1:{port}/data.gz");
+    let source = DataSource {
+        url: &source_url,
+        sha256: expected_sha256,
+    };
+
+    let result = update_data(path, &source);
+    server.join().unwrap();
+    result
 }
 
 fn compatible_conn() -> rusqlite::Connection {
