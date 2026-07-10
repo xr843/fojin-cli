@@ -177,7 +177,13 @@ pub fn validate_compatibility(conn: &rusqlite::Connection) -> Result<DatasetComp
     require_schema(
         conn,
         "parallels",
-        "SELECT id, zh_text, zh_norm, foreign_lang, foreign_text, cbeta_id FROM parallels LIMIT 0",
+        "SELECT id, zh_text, zh_norm, foreign_lang, foreign_text, confidence, cbeta_id, title_zh, \
+         juan_num FROM parallels LIMIT 0",
+    )?;
+    require_schema(
+        conn,
+        "parallels_fts",
+        "SELECT rowid, zh_norm FROM parallels_fts LIMIT 0",
     )?;
     require_schema(
         conn,

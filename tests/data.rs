@@ -231,6 +231,47 @@ fn compatibility_rejects_missing_required_schema() {
 }
 
 #[test]
+fn compatibility_rejects_missing_parallels_fts() {
+    let conn = compatible_conn();
+    conn.execute("DROP TABLE parallels_fts", []).unwrap();
+
+    let err = validate_compatibility(&conn).unwrap_err().to_string();
+    assert!(err.contains("parallels_fts"), "got: {err}");
+    assert!(err.contains("fojin data update"), "got: {err}");
+}
+
+#[test]
+fn compatibility_rejects_missing_query_required_parallels_column() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+         CREATE TABLE norm_map (from_char TEXT PRIMARY KEY, to_char TEXT NOT NULL);
+         CREATE TABLE parallels (
+             id INTEGER PRIMARY KEY,
+             zh_text TEXT NOT NULL,
+             zh_norm TEXT NOT NULL,
+             foreign_lang TEXT NOT NULL,
+             foreign_text TEXT NOT NULL,
+             cbeta_id TEXT,
+             title_zh TEXT,
+             juan_num INTEGER
+         );
+         CREATE VIRTUAL TABLE parallels_fts USING fts5(
+             zh_norm,
+             content='parallels',
+             content_rowid='id',
+             tokenize='trigram'
+         );",
+    )
+    .unwrap();
+    insert_compat_meta(&conn);
+
+    let err = validate_compatibility(&conn).unwrap_err().to_string();
+    assert!(err.contains("parallels"), "got: {err}");
+    assert!(err.contains("fojin data update"), "got: {err}");
+}
+
+#[test]
 fn compatibility_open_compatible_db_checks_file_before_returning_connection() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.sqlite");
