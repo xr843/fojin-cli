@@ -8,10 +8,12 @@
 
 ```
 $ fojin parallel "色即是空"
-汉  色即是空  (《心經》T0251 卷1)
-梵  rūpaṃ śūnyatā ...      [MITRA 0.91]
-藏  gzugs stong pa ...     [MITRA 0.88]
+汉  色不異空，空不異色，色即是空，空即是色；  (《般若波羅蜜多心經》T0251 卷1)
+梵  śūnyat'aiva rūpaṃ, rūpān na pṛthak śūnyatā …  [MITRA 1.00]
+藏  གཟུགས་ལས་སྟོང་པ་ཉིད་གཞན་མ་ཡིན༏ …  [MITRA 1.00]
 巴  (无对齐)
+
+… 还有 38 组匹配,加 --all 查看全部
 
 完整上下文见 https://fojin.app  ·  数据 CC BY-SA(Dharmamitra + fojin)
 ```
@@ -32,7 +34,7 @@ cargo install fojin-cli
 cargo install --git https://github.com/xr843/fojin-cli
 ```
 
-首次运行 `fojin parallel` 会自动下载对齐数据集(见下方「数据集」),之后完全离线。
+首次运行 `fojin parallel` 会自动下载对齐数据集(约 183 MB,带进度显示,见下方「数据集」),之后完全离线。
 
 ## 功能 / Usage
 
@@ -44,8 +46,8 @@ echo "色即是空" | fojin parallel    # 或从 stdin 读取
 | flag | 说明 | 默认值 |
 | --- | --- | --- |
 | `--lang sa,bo` | 只看指定语种,逗号分隔(如 `sa,bo,pi`) | 显示 sa/bo/pi |
-| `--top N` | 每个语种最多显示 N 条平行 | `3` |
-| `--limit N` | 最多显示 N 组匹配 | `10` |
+| `--top N` | 每个语种最多显示 N 条平行(N ≥ 1) | `3` |
+| `--limit N` | 最多显示 N 组匹配(N ≥ 1) | `10` |
 | `--all` | 显示全部匹配组,忽略 `--limit` | — |
 | `--json` | 输出机器可读 JSON | — |
 | `--data-dir <path>` | 指定数据目录,覆盖默认缓存位置 | 系统缓存目录 |
@@ -72,22 +74,41 @@ fojin parallel "色即是空" --json
 ```json
 {
   "matched": true,
-  "total": 1,
+  "total": 10,
   "shown": 1,
   "groups": [
     {
-      "zh_text": "色即是空",
-      "cbeta_id": "T0251",
-      "title_zh": "心經",
+      "zh_text": "是故菩薩應生如是無住著心，不住色、聲、香、味、觸、法生心，應無所住而生其心。",
+      "cbeta_id": "T0237",
+      "title_zh": "金剛般若波羅蜜經",
       "juan_num": 1,
       "parallels": [
-        { "lang": "sa", "text": "rūpaṃ śūnyatā ...", "confidence": 0.91 },
-        { "lang": "bo", "text": "gzugs stong pa ...", "confidence": 0.88 }
+        { "lang": "sa", "text": "tasmāt tarhi subhūte bodhisatvena evaṃ cittam utpādayitavyaṃ apratiṣṭhitaṃ …", "confidence": 1.0 },
+        { "lang": "bo", "text": "བྱང་ཆུབ་སེམས་དཔའ་སེམས་དཔའ་ཆེན་པོས་འདི་ལྟར་མི་གནས་པར་སེམས་བསྐྱེད་པར་བྱའོ་༎ …", "confidence": 1.0 }
       ]
     }
   ]
 }
 ```
+
+(示例取自真实查询 `fojin parallel "应无所住" --json --top 1 --limit 1`,文本有截断;字段实际按字母序输出。)
+
+## 输入规则与匹配方式
+
+- 查询须至少 **2 个汉字**;单字查询会被拒绝(范围过大,无对读价值)。
+- **简繁通用、标点无关**:查询前自动做简繁归一并剥离标点——简体「应无所住」可直接命中繁体原文「應無所住而生其心」。
+- 匹配为**整串子串匹配**(FTS5 trigram):查询串须连续完整出现在某条经文分段中。4~12 字的短语/名句命中最佳;整段文字超出分段长度,基本查不到——请拆成短句分别查。
+- 输入端仅支持汉文(查询方向:汉 → 梵/藏);用梵文转写或藏文查询不会报错,但必然「未找到对齐」。
+
+## 退出码
+
+| code | 含义 |
+| --- | --- |
+| `0` | 成功(包括「未找到对齐」) |
+| `1` | 运行期错误(数据缺失、下载校验失败、单字查询等) |
+| `2` | 用法错误(非法参数、无输入) |
+
+进度与提示信息全部走 stderr;`--json` 时 stdout 保证为纯 JSON,可直接接管道。
 
 ## 数据集
 
@@ -95,7 +116,8 @@ fojin parallel "色即是空" --json
   - 藏 / Tibetan:676,898 条
   - 梵 / Sanskrit:231,722 条
 - 来源:Dharmamitra 的 MITRA 对齐数据集,以 GitHub Release(`data-v1`)形式分发。
-- 首次运行时下载,压缩包约 **184 MB**,解压后约 **561 MB**(SQLite)。下载后完全离线可用。
+- 首次运行时下载,压缩包约 **183 MB**,解压后约 **561 MB**(SQLite)。下载后完全离线可用。
+- 当前不含巴利对齐,`pi` 恒显示「(无对齐)」;不想看到该行可用 `--lang sa,bo`。
 - 许可:**CC BY-SA 4.0**(Dharmamitra + fojin)。
 - 范围:仅含 MITRA 跨藏平行;fojin 自有的精选对齐(alignment_pairs)**未包含**在本数据集中。
 - 未来可能提供体积更小的 lite 子集,供带宽/存储受限场景使用(尚未实现)。
