@@ -223,11 +223,7 @@ pub fn verify_dataset(conn: &rusqlite::Connection) -> Result<DatasetCompatibilit
             )
         })?;
 
-    if !diagnostics.is_empty()
-        && diagnostics
-            .iter()
-            .all(|message| message == "ok" || is_read_only_fts5_check_limitation(message))
-    {
+    if diagnostics.as_slice() == ["ok"] {
         return Ok(compatibility);
     }
 
@@ -239,13 +235,6 @@ pub fn verify_dataset(conn: &rusqlite::Connection) -> Result<DatasetCompatibilit
     Err(anyhow!(
         "dataset incompatibility: PRAGMA quick_check failed: {summary}. Run `fojin data update`."
     ))
-}
-
-fn is_read_only_fts5_check_limitation(message: &str) -> bool {
-    // SQLite 3.45.0 implements FTS5 xIntegrity through a special INSERT.
-    // SQLite 3.45.1 fixed that command failing on read-only databases.
-    message.starts_with("unable to validate the inverted index for FTS5 table ")
-        && message.ends_with(": attempt to write a readonly database")
 }
 
 pub fn open_compatible_db(path: &Path) -> Result<rusqlite::Connection> {
