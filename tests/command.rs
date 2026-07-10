@@ -35,5 +35,8 @@ fn punctuation_only_query_keeps_empty_result_contract() {
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(String::from_utf8(output.stderr).unwrap(), "");
-    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "未找到对齐");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "未找到对齐"
+    );
 }
