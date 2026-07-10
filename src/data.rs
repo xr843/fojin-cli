@@ -16,6 +16,52 @@ pub struct DataSource<'a> {
     pub sha256: &'a str,
 }
 
+const MB: u64 = 1024 * 1024;
+
+/// Tracks download progress and yields a message each time a new 10% decile
+/// is crossed (at most once per decile). Silent when total size is unknown.
+pub struct Progress {
+    total: Option<u64>,
+    done: u64,
+    last_decile: u64,
+}
+
+impl Progress {
+    pub fn new(total: Option<u64>) -> Self {
+        Self {
+            total,
+            done: 0,
+            last_decile: 0,
+        }
+    }
+
+    pub fn advance(&mut self, bytes: u64) -> Option<String> {
+        self.done = self.done.saturating_add(bytes);
+        let total = self.total.filter(|&t| t > 0)?;
+        let decile = (self.done.saturating_mul(10) / total).min(10);
+        if decile <= self.last_decile {
+            return None;
+        }
+        self.last_decile = decile;
+        Some(format!(
+            "下载中... {}% ({}/{} MB)",
+            decile * 10,
+            self.done / MB,
+            total / MB
+        ))
+    }
+}
+
+pub fn download_notice(total: Option<u64>) -> String {
+    match total {
+        Some(t) => format!(
+            "首次运行:正在下载对齐数据 ({} MB),完成后即可完全离线使用...",
+            t / MB
+        ),
+        None => "首次运行:正在下载对齐数据,完成后即可完全离线使用...".to_string(),
+    }
+}
+
 pub fn resolve_data_path(data_dir: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(d) = data_dir {
         return Ok(d.join("data.sqlite"));
@@ -93,10 +139,22 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
         .get(url)
         .call()
         .with_context(|| format!("下载失败: {url}"))?;
+    let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
+    eprintln!("{}", download_notice(total));
+    let mut progress = Progress::new(total);
+    let mut reader = resp.into_reader();
     let mut buf = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut buf)
-        .context("读取响应失败")?;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut chunk).context("读取响应失败")?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(msg) = progress.advance(n as u64) {
+            eprintln!("{msg}");
+        }
+    }
     Ok(buf)
 }
 
