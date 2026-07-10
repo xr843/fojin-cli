@@ -45,6 +45,14 @@ fn json_flags_matched() {
 }
 
 #[test]
+fn json_empty_shown_still_reports_matches_when_total_is_positive() {
+    let out = render_json(&[], 3);
+    assert!(out.contains("\"matched\": true"));
+    assert!(out.contains("\"shown\": 0"));
+    assert!(out.contains("\"total\": 3"));
+}
+
+#[test]
 fn human_shows_extra_lang_and_full_footer() {
     let mut g = heart();
     g.parallels.push(Parallel {

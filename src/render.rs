@@ -76,7 +76,7 @@ pub fn render_human(groups: &[MatchGroup], langs: Option<&[String]>, hidden: usi
 
 pub fn render_json(groups: &[MatchGroup], total: usize) -> String {
     let v = serde_json::json!({
-        "matched": !groups.is_empty(),
+        "matched": total > 0,
         "total": total,
         "shown": groups.len(),
         "groups": groups,

@@ -28,10 +28,18 @@ pub enum Command {
         #[arg(long)]
         lang: Option<String>,
         /// 每语最多 N 条
-        #[arg(long, default_value_t = 3)]
+        #[arg(
+            long,
+            default_value_t = 3,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+        )]
         top: usize,
         /// 最多显示 N 组匹配
-        #[arg(long, default_value_t = 10)]
+        #[arg(
+            long,
+            default_value_t = 10,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+        )]
         limit: usize,
         /// 显示全部匹配组,忽略 --limit
         #[arg(long)]
