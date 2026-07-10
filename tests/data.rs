@@ -600,25 +600,31 @@ fn update_data_preserves_live_dataset_when_candidate_is_corrupt() {
 }
 
 #[test]
-fn update_data_cleans_stale_candidate_artifacts_on_failure() {
+fn update_data_preserves_foreign_candidate_artifacts_and_cleans_its_own() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.sqlite");
     std::fs::write(&path, b"old live dataset").unwrap();
-    let candidate = sibling_path(&path, ".candidate");
+    let foreign_candidate = sibling_path(&path, ".candidate");
     for suffix in ["", "-journal", "-shm", "-wal"] {
-        std::fs::write(sibling_path(&candidate, suffix), b"stale").unwrap();
+        std::fs::write(sibling_path(&foreign_candidate, suffix), b"foreign").unwrap();
     }
+    let database = compatible_database_bytes(|conn| {
+        conn.execute("UPDATE meta SET value = 'v0' WHERE key = 'version'", [])
+            .unwrap();
+    });
+    let gz = gzip_bytes(&database);
+    let sha = sha256_hex(&gz);
 
-    serve_update_response(
-        &path,
-        "500 Internal Server Error",
-        b"download failed".to_vec(),
-        "unused",
-    )
-    .unwrap_err();
+    serve_update(&path, gz, &sha).unwrap_err();
 
     assert_eq!(std::fs::read(&path).unwrap(), b"old live dataset");
-    assert_no_candidate_artifacts(&path);
+    for suffix in ["", "-journal", "-shm", "-wal"] {
+        assert_eq!(
+            std::fs::read(sibling_path(&foreign_candidate, suffix)).unwrap(),
+            b"foreign"
+        );
+    }
+    assert_no_owned_candidate_artifacts(&path);
 }
 
 #[test]
@@ -684,6 +690,22 @@ fn assert_no_candidate_artifacts(path: &std::path::Path) {
             artifact.display()
         );
     }
+    assert_no_owned_candidate_artifacts(path);
+}
+
+fn assert_no_owned_candidate_artifacts(path: &std::path::Path) {
+    let mut prefix = path.file_name().unwrap().to_os_string();
+    prefix.push(".candidate.");
+    let prefix = prefix.to_string_lossy();
+    let owned: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(prefix.as_ref()))
+        .collect();
+    assert!(
+        owned.is_empty(),
+        "owned candidate artifacts remain: {owned:?}"
+    );
 }
 
 fn sibling_path(path: &std::path::Path, suffix: &str) -> PathBuf {

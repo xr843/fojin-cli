@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{OpenFlags, OptionalExtension};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Connect timeout for the data download: fails fast if the release host is
@@ -11,6 +12,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// so this is generous for a slow-but-alive connection while still
 /// guaranteeing the CLI can never hang indefinitely.
 const READ_TIMEOUT: Duration = Duration::from_secs(900);
+static CANDIDATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub const EXPECTED_DATA_VERSION: &str = "v1";
 pub const EXPECTED_NORM_RULESET: &str = "t2s-char-1to1-v1";
@@ -126,14 +128,17 @@ pub fn update_data(path: &Path, source: &DataSource) -> Result<()> {
         std::fs::create_dir_all(parent).context("创建缓存目录失败")?;
     }
 
-    let candidate = sibling_path(path, ".candidate")?;
-    remove_candidate_artifacts(&candidate)?;
+    let raw = download_and_unpack(path, source)?;
+    let (candidate, mut candidate_file) = create_candidate(path)?;
+    let write_result = candidate_file
+        .write_all(&raw)
+        .with_context(|| format!("写入候选数据失败: {}", candidate.display()));
+    drop(candidate_file);
+    if let Err(error) = write_result {
+        return Err(cleanup_candidate_error(&candidate, error));
+    }
 
     let result = (|| {
-        let raw = download_and_unpack(path, source)?;
-        std::fs::write(&candidate, raw)
-            .with_context(|| format!("写入候选数据失败: {}", candidate.display()))?;
-
         let conn = open_read_only_db(&candidate)?;
         verify_dataset(&conn)?;
         drop(conn);
@@ -143,12 +148,7 @@ pub fn update_data(path: &Path, source: &DataSource) -> Result<()> {
 
     match result {
         Ok(()) => Ok(()),
-        Err(error) => {
-            if let Err(cleanup_error) = remove_candidate_artifacts(&candidate) {
-                return Err(error.context(format!("清理候选数据失败: {cleanup_error}")));
-            }
-            Err(error)
-        }
+        Err(error) => Err(cleanup_candidate_error(&candidate, error)),
     }
 }
 
@@ -177,6 +177,33 @@ fn sibling_path(path: &Path, suffix: &str) -> Result<PathBuf> {
     let mut sibling = file_name.to_os_string();
     sibling.push(suffix);
     Ok(path.with_file_name(sibling))
+}
+
+fn create_candidate(path: &Path) -> Result<(PathBuf, std::fs::File)> {
+    loop {
+        let sequence = CANDIDATE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let suffix = format!(".candidate.{}.{sequence}", std::process::id());
+        let candidate = sibling_path(path, &suffix)?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(ref error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("创建候选数据失败: {}", candidate.display()))
+            }
+        }
+    }
+}
+
+fn cleanup_candidate_error(candidate: &Path, error: anyhow::Error) -> anyhow::Error {
+    match remove_candidate_artifacts(candidate) {
+        Ok(()) => error,
+        Err(cleanup_error) => error.context(format!("清理候选数据失败: {cleanup_error}")),
+    }
 }
 
 fn remove_candidate_artifacts(candidate: &Path) -> Result<()> {
@@ -213,14 +240,20 @@ fn replace_with_candidate(path: &Path, candidate: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn replace_with_candidate(path: &Path, candidate: &Path) -> Result<()> {
-    if !path.exists() {
-        return std::fs::rename(candidate, path).with_context(|| {
-            format!(
-                "替换数据文件失败: {} -> {}",
-                candidate.display(),
-                path.display()
-            )
-        });
+    match std::fs::metadata(path) {
+        Ok(_) => {}
+        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return std::fs::rename(candidate, path).with_context(|| {
+                format!(
+                    "替换数据文件失败: {} -> {}",
+                    candidate.display(),
+                    path.display()
+                )
+            })
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("检查现有数据文件失败: {}", path.display()))
+        }
     }
 
     use std::ffi::c_void;
@@ -267,20 +300,67 @@ fn replace_with_candidate(path: &Path, candidate: &Path) -> Result<()> {
     }
 
     let native_error = std::io::Error::last_os_error();
-    if path.exists() && !candidate.exists() {
-        return Ok(());
-    }
-    if !path.exists() && candidate.exists() && std::fs::rename(candidate, path).is_ok() {
-        return Ok(());
-    }
+    handle_windows_replace_failure(path, candidate, native_error, std::fs::rename)
+}
 
-    Err(native_error).with_context(|| {
-        format!(
-            "原子替换数据文件失败: {} -> {}",
-            candidate.display(),
-            path.display()
-        )
-    })
+#[cfg(windows)]
+fn handle_windows_replace_failure<F>(
+    path: &Path,
+    candidate: &Path,
+    native_error: std::io::Error,
+    recover: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    const ERROR_UNABLE_TO_REMOVE_REPLACED: i32 = 1175;
+    const ERROR_UNABLE_TO_MOVE_REPLACEMENT: i32 = 1176;
+    const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: i32 = 1177;
+
+    match native_error.raw_os_error() {
+        Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT | ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) => {
+            match recover(candidate, path) {
+                Ok(()) => Ok(()),
+                Err(recovery_error) => Err(anyhow!(
+                    "ReplaceFileW failed for replaced `{}` and replacement `{}` with {}; recovery rename `{} -> {}` failed with {}",
+                    path.display(),
+                    candidate.display(),
+                    describe_windows_error(&native_error),
+                    candidate.display(),
+                    path.display(),
+                    describe_windows_error(&recovery_error)
+                )),
+            }
+        }
+        Some(ERROR_UNABLE_TO_REMOVE_REPLACED) => Err(windows_replace_error(
+            path,
+            candidate,
+            &native_error,
+        )),
+        _ => Err(windows_replace_error(path, candidate, &native_error)),
+    }
+}
+
+#[cfg(windows)]
+fn windows_replace_error(
+    path: &Path,
+    candidate: &Path,
+    native_error: &std::io::Error,
+) -> anyhow::Error {
+    anyhow!(
+        "ReplaceFileW failed for replaced `{}` and replacement `{}` with {}",
+        path.display(),
+        candidate.display(),
+        describe_windows_error(native_error)
+    )
+}
+
+#[cfg(windows)]
+fn describe_windows_error(error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("Windows error {code}: {error}"),
+        None => error.to_string(),
+    }
 }
 
 fn http_get(url: &str) -> Result<Vec<u8>> {
@@ -506,4 +586,102 @@ fn require_expected_meta(conn: &rusqlite::Connection, key: &str, expected: &str)
     }
 
     Ok(got)
+}
+
+#[cfg(all(test, windows))]
+mod windows_replace_failure_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io;
+
+    const LIVE: &str = r"C:\cache\data.sqlite";
+    const CANDIDATE: &str = r"C:\cache\data.sqlite.candidate.1.1";
+
+    #[test]
+    fn error_1175_returns_native_failure_without_recovery() {
+        assert_names_untouched_error_skips_recovery(1175);
+    }
+
+    #[test]
+    fn other_error_returns_native_failure_without_recovery() {
+        assert_names_untouched_error_skips_recovery(87);
+    }
+
+    #[test]
+    fn error_1176_recovers_missing_live_path() {
+        assert_partial_failure_recovers(1176);
+    }
+
+    #[test]
+    fn error_1177_recovers_missing_live_path() {
+        assert_partial_failure_recovers(1177);
+    }
+
+    #[test]
+    fn error_1176_preserves_native_and_recovery_failures() {
+        assert_partial_failure_preserves_both_errors(1176);
+    }
+
+    #[test]
+    fn error_1177_preserves_native_and_recovery_failures() {
+        assert_partial_failure_preserves_both_errors(1177);
+    }
+
+    fn assert_names_untouched_error_skips_recovery(code: i32) {
+        let recovery_called = Cell::new(false);
+        let error = handle_windows_replace_failure(
+            Path::new(LIVE),
+            Path::new(CANDIDATE),
+            io::Error::from_raw_os_error(code),
+            |_, _| {
+                recovery_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(!recovery_called.get());
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains(&format!("Windows error {code}")),
+            "{detail}"
+        );
+    }
+
+    fn assert_partial_failure_recovers(code: i32) {
+        let recovery_called = Cell::new(false);
+        handle_windows_replace_failure(
+            Path::new(LIVE),
+            Path::new(CANDIDATE),
+            io::Error::from_raw_os_error(code),
+            |from, to| {
+                recovery_called.set(true);
+                assert_eq!(from, Path::new(CANDIDATE));
+                assert_eq!(to, Path::new(LIVE));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(recovery_called.get());
+    }
+
+    fn assert_partial_failure_preserves_both_errors(code: i32) {
+        let error = handle_windows_replace_failure(
+            Path::new(LIVE),
+            Path::new(CANDIDATE),
+            io::Error::from_raw_os_error(code),
+            |_, _| Err(io::Error::from_raw_os_error(5)),
+        )
+        .unwrap_err();
+
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains(&format!("Windows error {code}")),
+            "{detail}"
+        );
+        assert!(detail.contains("Windows error 5"), "{detail}");
+        assert!(detail.contains(CANDIDATE), "{detail}");
+        assert!(detail.contains(LIVE), "{detail}");
+    }
 }
