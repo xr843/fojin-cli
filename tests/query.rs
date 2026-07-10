@@ -117,6 +117,145 @@ fn empty_query_returns_empty() {
     assert!(search(&conn, "", None, 3).unwrap().is_empty());
 }
 
+#[test]
+fn exact_sentence_outranks_longer_higher_confidence_match() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    for (zt, zn, lang, f, c, cb, ti, j) in [
+        (
+            "舍利子色不异空色即是空空即是色",
+            "舍利子色不异空色即是空空即是色",
+            "sa",
+            "long-high",
+            1.0,
+            "T0002",
+            "長句",
+            1,
+        ),
+        (
+            "色即是空",
+            "色即是空",
+            "sa",
+            "exact-lower",
+            0.8,
+            "T0001",
+            "短句",
+            1,
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![zt, zn, lang, f, c, cb, ti, j],
+        )
+        .unwrap();
+    }
+
+    let groups = search(&conn, "色即是空", None, 3).unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].zh_text, "色即是空");
+}
+
+#[test]
+fn shorter_containing_sentence_outranks_longer_peer() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    for (zt, zn, lang, f, c, cb, ti, j) in [
+        (
+            "觀自在菩薩行深般若波羅蜜多時照見五蘊皆空色即是空",
+            "观自在菩萨行深般若波罗蜜多时照见五蕴皆空色即是空",
+            "sa",
+            "long-peer",
+            1.0,
+            "T0002",
+            "長句",
+            1,
+        ),
+        (
+            "五蘊皆空色即是空",
+            "五蕴皆空色即是空",
+            "sa",
+            "short-peer",
+            1.0,
+            "T0003",
+            "短句",
+            1,
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![zt, zn, lang, f, c, cb, ti, j],
+        )
+        .unwrap();
+    }
+
+    let groups = search(&conn, "色即是空", None, 3).unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].zh_text, "五蘊皆空色即是空");
+}
+
+#[test]
+fn relevance_ties_use_stable_source_order() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    for (zt, zn, lang, f, cb) in [
+        (
+            "甲色即是空乙",
+            "甲色即是空乙",
+            "sa",
+            "first-inserted",
+            "T0002",
+        ),
+        (
+            "丙色即是空丁",
+            "丙色即是空丁",
+            "sa",
+            "second-inserted",
+            "T0001",
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?2,?3,?4,1.0,?5,'同分',1)",
+            params![zt, zn, lang, f, cb],
+        )
+        .unwrap();
+    }
+
+    let groups = search(&conn, "色即是空", None, 3).unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].cbeta_id.as_deref(), Some("T0001"));
+}
+
+#[test]
+fn relevance_ties_order_by_juan_then_zh_text() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    for (zt, j) in [("色即是空A", 2), ("色即是空C", 1), ("色即是空B", 1)] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?1,'sa',?1,1.0,'T0001','同分',?2)",
+            params![zt, j],
+        )
+        .unwrap();
+    }
+
+    let groups = search(&conn, "色即是空", None, 3).unwrap();
+    let order: Vec<_> = groups
+        .iter()
+        .map(|group| (group.juan_num, group.zh_text.as_str()))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (Some(1), "色即是空B"),
+            (Some(1), "色即是空C"),
+            (Some(2), "色即是空A"),
+        ]
+    );
+}
+
 fn cite_fixture() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();

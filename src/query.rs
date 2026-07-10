@@ -1,7 +1,7 @@
 use crate::model::{MatchGroup, Parallel};
 use rusqlite::Connection;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 struct Row {
     zh_text: String,
@@ -64,12 +64,20 @@ fn fetch_rows(conn: &Connection, norm_query: &str) -> rusqlite::Result<Vec<Row>>
     iter.collect()
 }
 
+#[derive(Hash, PartialEq, Eq)]
+struct GroupKey {
+    zh_text: String,
+    cbeta_id: Option<String>,
+    juan_num: Option<i64>,
+}
+
 struct Acc {
     zh_text: String,
     cbeta_id: Option<String>,
     title_zh: Option<String>,
     juan_num: Option<i64>,
-    contains: bool,
+    exact: bool,
+    excess_chars: usize,
     max_conf: f64,
     parallels: Vec<Parallel>,
 }
@@ -81,6 +89,8 @@ fn group_and_rank(
     top: usize,
 ) -> Vec<MatchGroup> {
     let mut accs: Vec<Acc> = Vec::new();
+    let mut acc_idx: HashMap<GroupKey, usize> = HashMap::new();
+    let query_chars = norm_query.chars().count();
     for row in rows {
         if let Some(filter) = langs {
             if !filter.iter().any(|l| l == &row.foreign_lang) {
@@ -88,10 +98,18 @@ fn group_and_rank(
             }
         }
         let contains = row.zh_norm.contains(norm_query);
-        let idx = accs.iter().position(|a| {
-            a.zh_text == row.zh_text && a.cbeta_id == row.cbeta_id && a.juan_num == row.juan_num
-        });
-        let idx = match idx {
+        let exact = row.zh_norm == norm_query;
+        let excess_chars = if contains {
+            row.zh_norm.chars().count().saturating_sub(query_chars)
+        } else {
+            row.zh_norm.chars().count()
+        };
+        let key = GroupKey {
+            zh_text: row.zh_text.clone(),
+            cbeta_id: row.cbeta_id.clone(),
+            juan_num: row.juan_num,
+        };
+        let idx = match acc_idx.get(&key).copied() {
             Some(i) => i,
             None => {
                 accs.push(Acc {
@@ -99,18 +117,24 @@ fn group_and_rank(
                     cbeta_id: row.cbeta_id.clone(),
                     title_zh: row.title_zh.clone(),
                     juan_num: row.juan_num,
-                    contains: false,
+                    exact: false,
+                    excess_chars,
                     max_conf: 0.0,
                     parallels: Vec::new(),
                 });
-                accs.len() - 1
+                let idx = accs.len() - 1;
+                acc_idx.insert(key, idx);
+                idx
             }
         };
         let conf = row.confidence.unwrap_or(0.0);
         if conf > accs[idx].max_conf {
             accs[idx].max_conf = conf;
         }
-        accs[idx].contains |= contains;
+        accs[idx].exact |= exact;
+        if excess_chars < accs[idx].excess_chars {
+            accs[idx].excess_chars = excess_chars;
+        }
         accs[idx].parallels.push(Parallel {
             lang: row.foreign_lang,
             text: row.foreign_text,
@@ -118,28 +142,25 @@ fn group_and_rank(
         });
     }
 
-    let mut ranked: Vec<(bool, f64, MatchGroup)> = accs
-        .into_iter()
-        .map(|a| {
-            (
-                a.contains,
-                a.max_conf,
-                MatchGroup {
-                    zh_text: a.zh_text,
-                    cbeta_id: a.cbeta_id,
-                    title_zh: a.title_zh,
-                    juan_num: a.juan_num,
-                    parallels: cap_per_lang(a.parallels, top),
-                },
-            )
-        })
-        .collect();
-
-    ranked.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then(b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal))
+    accs.sort_by(|a, b| {
+        b.exact
+            .cmp(&a.exact)
+            .then(a.excess_chars.cmp(&b.excess_chars))
+            .then_with(|| b.max_conf.total_cmp(&a.max_conf))
+            .then_with(|| a.cbeta_id.cmp(&b.cbeta_id))
+            .then_with(|| a.juan_num.cmp(&b.juan_num))
+            .then_with(|| a.zh_text.cmp(&b.zh_text))
     });
-    ranked.into_iter().map(|(_, _, g)| g).collect()
+
+    accs.into_iter()
+        .map(|a| MatchGroup {
+            zh_text: a.zh_text,
+            cbeta_id: a.cbeta_id,
+            title_zh: a.title_zh,
+            juan_num: a.juan_num,
+            parallels: cap_per_lang(a.parallels, top),
+        })
+        .collect()
 }
 
 /// List a text's aligned groups by Taishō id (case-insensitive), optionally
