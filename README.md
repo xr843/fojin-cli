@@ -2,9 +2,12 @@
 
 [![CI](https://github.com/xr843/fojin-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/xr843/fojin-cli/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/fojin-cli.svg)](https://crates.io/crates/fojin-cli)
+[![release](https://img.shields.io/github/v/release/xr843/fojin-cli?filter=v*&label=release)](https://github.com/xr843/fojin-cli/releases/latest)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可)
 
 **离线 · 无需登录 · 单二进制。** 给一段汉文,查它在梵/巴/藏正典中的平行文本。本地查询毫秒级(实测典型 2 ms,数千组命中的高频词约 0.3 s)。
+
+*English readers: see the [English summary](#english-summary) at the bottom.*
 
 ```
 $ fojin parallel "色即是空"
@@ -176,3 +179,23 @@ fojin parallel "<汉文短语>" --json --offline
 `fojin-cli` 是 [fojin](https://fojin.app) 开放工具集的一部分 —— fojin.app 提供带账号的在线阅读与对读体验,`fojin-cli` 是其离线、无需登录的命令行对应物,共享同一份跨藏佛典对齐数据。
 
 <!-- ecosystem: add masterl-kill link once its repo is known -->
+
+## English Summary
+
+**fojin-cli** is an offline command-line tool: give it a Chinese Buddhist canonical passage, it returns the aligned Sanskrit/Tibetan parallels — from a local SQLite, in ~2 ms, fully offline after a one-time 183 MB data download. Single binary, no account, deterministic output.
+
+```bash
+cargo install fojin-cli          # or: curl -fsSL https://raw.githubusercontent.com/xr843/fojin-cli/master/install.sh | sh
+fojin parallel "色即是空"         # Sanskrit + Tibetan parallels with Taishō source refs
+fojin texts "心经"                # fuzzy title search → Taishō numbers
+fojin cite T0251                  # browse one text's alignments in canonical order
+fojin data status                 # local dataset stats
+```
+
+- **Input**: Chinese only (traditional/simplified folded, punctuation ignored); literal substring matching over normalized text. 2-to-12-character phrases work best.
+- **For AI agents**: pure-JSON stdout, semantic exit codes (`0` ok / `1` runtime / `2` usage), zero network with `--offline`. Ready-made Claude Code integration in [`examples/claude/`](examples/claude/).
+- **Data**: 908,620 zh↔sa/bo alignments from Dharmamitra's [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) dataset, redistributed under CC BY-SA 4.0. Academic use: please cite [Nehrdich & Keutzer (2026)](https://arxiv.org/pdf/2601.06400) — BibTeX in [`DATA_LICENSE`](DATA_LICENSE).
+- **Not in scope**: semantic search, Pāli, translation — use [Dharmamitra](https://dharmamitra.org)'s online APIs for those; the two are complementary.
+- **License**: code MIT OR Apache-2.0; data CC BY-SA 4.0.
+
+Part of the [fojin](https://fojin.app) open tool suite — fojin.app is the online reading & parallel-reading platform; fojin-cli is its offline, no-login companion.
