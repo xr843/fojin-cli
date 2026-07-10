@@ -2,7 +2,20 @@ The data artifact distributed with fojin-cli (fojin-parallels-*.sqlite[.gz])
 is licensed CC BY-SA 4.0.
 
 Attribution: Dharmamitra (https://dharmamitra.org) + fojin.app.
-Source alignments imported from Dharmamitra's open MITRA dataset.
+Source alignments imported from Dharmamitra's open MITRA-parallel dataset
+(https://github.com/dharmamitra/mitra-parallel, CC BY-SA 4.0).
+
+If you use this data in academic work, please cite the MITRA paper:
+
+  @article{nehrdich2026mitra,
+    title={MITRA: A Large-Scale Parallel Corpus and Multilingual Pretrained
+           Language Model for Machine Translation and Semantic Retrieval for
+           Pāli, Sanskrit, Buddhist Chinese, and Tibetan},
+    author={Sebastian Nehrdich and Kurt Keutzer},
+    journal={arXiv preprint},
+    year={2026},
+    url={https://arxiv.org/pdf/2601.06400}
+  }
 
 Note: this artifact contains MITRA cross-canon parallels ONLY. fojin's own
 curated alignment_pairs are NOT included.

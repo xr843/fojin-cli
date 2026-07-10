@@ -157,7 +157,7 @@ fojin parallel "<汉文短语>" --json --offline
 - **908,620** 条跨正典平行,锚定到汉文大藏经(Taishō 编号 + 经名):
   - 藏 / Tibetan:676,898 条
   - 梵 / Sanskrit:231,722 条
-- 来源:Dharmamitra 的 MITRA 对齐数据集,以 GitHub Release(`data-v1`)形式分发。
+- 来源:Dharmamitra 的 [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) 对齐数据集([Nehrdich & Keutzer, 2026](https://arxiv.org/pdf/2601.06400)),以 GitHub Release(`data-v1`)形式分发;学术使用请引用原论文(BibTeX 见 [`DATA_LICENSE`](DATA_LICENSE))。
 - 首次运行时下载,压缩包约 **183 MB**,解压后约 **561 MB**(SQLite)。下载后完全离线可用。
 - 当前不含巴利对齐,`pi` 恒显示「(无对齐)」;不想看到该行可用 `--lang sa,bo`。
 - 许可:**CC BY-SA 4.0**(Dharmamitra + fojin)。
