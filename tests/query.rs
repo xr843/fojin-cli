@@ -228,6 +228,34 @@ fn relevance_ties_use_stable_source_order() {
     assert_eq!(groups[0].cbeta_id.as_deref(), Some("T0001"));
 }
 
+#[test]
+fn relevance_ties_order_by_juan_then_zh_text() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    for (zt, j) in [("色即是空C", 2), ("色即是空B", 1), ("色即是空A", 1)] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?1,'sa',?1,1.0,'T0001','同分',?2)",
+            params![zt, j],
+        )
+        .unwrap();
+    }
+
+    let groups = search(&conn, "色即是空", None, 3).unwrap();
+    let order: Vec<_> = groups
+        .iter()
+        .map(|group| (group.juan_num, group.zh_text.as_str()))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (Some(1), "色即是空A"),
+            (Some(1), "色即是空B"),
+            (Some(2), "色即是空C"),
+        ]
+    );
+}
+
 fn cite_fixture() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
