@@ -58,6 +58,7 @@ pub fn compute_output(
 ) -> Result<String> {
     let map = normalize::load_norm_map(conn)?;
     let norm = normalize::normalize(raw.trim(), &map);
+    normalize::validate_query_length(&norm)?;
     let groups_all = query::search(conn, &norm, langs, top)?;
     let total = groups_all.len();
     let shown = match limit {
@@ -98,6 +99,8 @@ pub fn run() -> Result<i32> {
                 eprintln!("用法: fojin parallel \"色即是空\"  (或管道: echo ... | fojin parallel)");
                 return Ok(2);
             }
+            let preflight = normalize::normalize(raw.trim(), &normalize::NormMap::new());
+            normalize::validate_query_length(&preflight)?;
             let path = data::resolve_data_path(data_dir)?;
             data::ensure_data(
                 &path,

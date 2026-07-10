@@ -38,3 +38,14 @@ fn load_norm_map_reads_rows() {
     let m = load_norm_map(&conn).unwrap();
     assert_eq!(m.get(&'應'), Some(&'应'));
 }
+
+#[test]
+fn rejects_single_character_query() {
+    let err = fojin_cli::normalize::validate_query_length("佛").unwrap_err();
+    assert!(err.to_string().contains("至少需要 2 个汉字"));
+}
+
+#[test]
+fn accepts_two_character_query() {
+    assert!(fojin_cli::normalize::validate_query_length("般若").is_ok());
+}
