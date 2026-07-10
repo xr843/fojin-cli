@@ -232,7 +232,7 @@ fn relevance_ties_use_stable_source_order() {
 fn relevance_ties_order_by_juan_then_zh_text() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
-    for (zt, j) in [("色即是空C", 2), ("色即是空B", 1), ("色即是空A", 1)] {
+    for (zt, j) in [("色即是空A", 2), ("色即是空C", 1), ("色即是空B", 1)] {
         conn.execute(
             "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
              VALUES (?1,?1,'sa',?1,1.0,'T0001','同分',?2)",
@@ -249,9 +249,9 @@ fn relevance_ties_order_by_juan_then_zh_text() {
     assert_eq!(
         order,
         [
-            (Some(1), "色即是空A"),
             (Some(1), "色即是空B"),
-            (Some(2), "色即是空C"),
+            (Some(1), "色即是空C"),
+            (Some(2), "色即是空A"),
         ]
     );
 }
