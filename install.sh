@@ -48,12 +48,73 @@ else
 fi
 
 asset="fojin-${version#v}-${target}.tar.gz"
-url="https://github.com/$REPO/releases/download/$version/$asset"
+release_url="https://github.com/$REPO/releases/download/$version"
+url="$release_url/$asset"
+checksums_url="$release_url/SHA256SUMS"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  checksum_tool="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+  checksum_tool="shasum"
+else
+  die "需要 sha256sum 或 shasum 来验证下载文件"
+fi
 
 say "下载 fojin $version ($target) ..."
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 curl -fsSL "$url" -o "$tmp/$asset" || die "下载失败: $url"
+curl -fsSL "$checksums_url" -o "$tmp/SHA256SUMS" || die "下载失败: $checksums_url"
+
+expected_checksum=$(awk -v asset="$asset" '
+  {
+    candidate = 0
+    for (field = 1; field <= NF; field++) {
+      if ($field == asset || $field == "*" asset) {
+        candidate = 1
+      }
+    }
+    if (!candidate) {
+      next
+    }
+
+    candidates++
+    if (NF != 2 || $2 != asset || length($1) != 64 || $1 ~ /[^0-9A-Fa-f]/) {
+      malformed = 1
+    } else {
+      checksum = tolower($1)
+    }
+  }
+  END {
+    if (candidates != 1 || malformed) {
+      exit 1
+    }
+    print checksum
+  }
+' "$tmp/SHA256SUMS") || die "SHA256SUMS 中缺少唯一且格式正确的 $asset 记录"
+
+case "$checksum_tool" in
+  sha256sum) checksum_output=$(sha256sum <"$tmp/$asset") || die "无法计算下载文件的 SHA-256" ;;
+  shasum) checksum_output=$(shasum -a 256 <"$tmp/$asset") || die "无法计算下载文件的 SHA-256" ;;
+esac
+actual_checksum=$(printf '%s\n' "$checksum_output" | awk '
+  {
+    lines++
+    if (NF != 2 || $2 != "-" || length($1) != 64 || $1 ~ /[^0-9A-Fa-f]/) {
+      malformed = 1
+    } else {
+      checksum = tolower($1)
+    }
+  }
+  END {
+    if (lines != 1 || malformed) {
+      exit 1
+    }
+    print checksum
+  }
+') || die "SHA-256 工具返回了格式错误的结果"
+[ "$actual_checksum" = "$expected_checksum" ] || die "下载文件的 SHA-256 校验失败: $asset"
+
 tar -xzf "$tmp/$asset" -C "$tmp"
 
 mkdir -p "$INSTALL_DIR"
