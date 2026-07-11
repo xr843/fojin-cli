@@ -6,7 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MIB: u64 = 1024 * 1024;
 const BUFFER_SIZE: usize = 64 * 1024;
@@ -208,24 +208,27 @@ fn stage_candidate_inner(
     policy: DownloadPolicy,
     compressed_file: &mut File,
 ) -> Result<StagedCandidate> {
+    let deadline = Instant::now()
+        .checked_add(policy.http_timeout)
+        .ok_or_else(|| anyhow!("HTTP 总超时配置溢出"))?;
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(policy.connect_timeout)
         .timeout_read(policy.idle_read_timeout)
-        .timeout(policy.http_timeout)
         .build();
     let response = agent
         .get(source.url)
         .set("Accept-Encoding", "identity")
-        .call()
-        .map_err(|error| {
-            anyhow!(
-                "下载失败: {}: {error}\n请手动下载:\n  {}\n解压后放到: {}",
-                source.url,
-                source.url,
-                live_path.display()
-            )
-        })?;
-    let declared = basic_declared_length(&response, policy.max_compressed)?;
+        .call();
+    require_http_deadline(deadline)?;
+    let response = response.map_err(|error| {
+        anyhow!(
+            "下载失败: {}: {error}\n请手动下载:\n  {}\n解压后放到: {}",
+            source.url,
+            source.url,
+            live_path.display()
+        )
+    })?;
+    let declared = declared_length(&response, policy.max_compressed)?;
     eprintln!("{}", download_notice(declared));
 
     let mut reader = response.into_reader();
@@ -234,7 +237,9 @@ fn stage_candidate_inner(
     let mut received = 0_u64;
     let mut buffer = [0_u8; BUFFER_SIZE];
     loop {
+        require_http_deadline(deadline)?;
         let count = reader.read(&mut buffer).context("读取响应失败")?;
+        require_http_deadline(deadline)?;
         if count == 0 {
             break;
         }
@@ -285,17 +290,35 @@ fn stage_candidate_inner(
     }
 }
 
-fn basic_declared_length(response: &ureq::Response, maximum: u64) -> Result<Option<u64>> {
-    let Some(value) = response.header("Content-Length") else {
-        return Ok(None);
-    };
-    let parsed = value
-        .parse::<u64>()
-        .with_context(|| format!("无效 Content-Length: {value}"))?;
-    if parsed > maximum {
-        return Err(anyhow!("Content-Length 超过下载限制: {parsed} > {maximum}"));
+fn require_http_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "HTTP total deadline timed out",
+        ))
+        .context("读取响应失败");
     }
-    Ok(Some(parsed))
+    Ok(())
+}
+
+fn declared_length(response: &ureq::Response, maximum: u64) -> Result<Option<u64>> {
+    if !response.all("Transfer-Encoding").is_empty() {
+        return Ok(None);
+    }
+    let values = response.all("Content-Length");
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => {
+            let parsed = value
+                .parse::<u64>()
+                .with_context(|| format!("无效 Content-Length: {value}"))?;
+            if parsed > maximum {
+                return Err(anyhow!("Content-Length 超过下载限制: {parsed} > {maximum}"));
+            }
+            Ok(Some(parsed))
+        }
+        _ => Err(anyhow!("响应包含重复 Content-Length")),
+    }
 }
 
 fn require_declared_length(declared: Option<u64>, received: u64) -> Result<()> {
@@ -325,7 +348,420 @@ mod tests {
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Write};
+
+    fn policy_for_tests() -> DownloadPolicy {
+        DownloadPolicy {
+            connect_timeout: Duration::from_millis(200),
+            idle_read_timeout: Duration::from_millis(200),
+            http_timeout: Duration::from_secs(2),
+            max_compressed: 1024,
+            max_uncompressed: 4096,
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn gzip(body: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+        }
+        request
+    }
+
+    fn stage_from_raw_response_with_sha(
+        response: &[u8],
+        sha256: &str,
+        policy: DownloadPolicy,
+    ) -> (Result<()>, Vec<u8>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = response.to_vec();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            stream.write_all(&response).unwrap();
+            request
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let url = format!("http://{address}/data.gz");
+        let result = stage_candidate(&live, &DataSource { url: &url, sha256 }, policy).map(drop);
+        let request = server.join().unwrap();
+        (result, request)
+    }
+
+    fn stage_from_raw_response(response: &[u8], policy: DownloadPolicy) -> Result<()> {
+        stage_from_raw_response_with_sha(response, &"0".repeat(64), policy).0
+    }
+
+    fn stage_from_delayed_raw_response(
+        response: &[u8],
+        delay: Duration,
+        policy: DownloadPolicy,
+    ) -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = response.to_vec();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            std::thread::sleep(delay);
+            stream.write_all(&response).unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let url = format!("http://{address}/data.gz");
+        let sha = "0".repeat(64);
+        let result = stage_candidate(
+            &live,
+            &DataSource {
+                url: &url,
+                sha256: &sha,
+            },
+            policy,
+        )
+        .map(drop);
+        server.join().unwrap();
+        result
+    }
+
+    fn stage_from_dribbling_server(interval: Duration, policy: DownloadPolicy) -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            for _ in 0..20 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                if stream.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(interval);
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let url = format!("http://{address}/data.gz");
+        let sha = "0".repeat(64);
+        let result = stage_candidate(
+            &live,
+            &DataSource {
+                url: &url,
+                sha256: &sha,
+            },
+            policy,
+        )
+        .map(drop);
+        server.join().unwrap();
+        result
+    }
+
+    fn stage_from_pausing_server(pause: Duration, policy: DownloadPolicy) -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nx")
+                .unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(pause);
+            let _ = stream.write_all(b"x");
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let url = format!("http://{address}/data.gz");
+        let sha = "0".repeat(64);
+        let result = stage_candidate(
+            &live,
+            &DataSource {
+                url: &url,
+                sha256: &sha,
+            },
+            policy,
+        )
+        .map(drop);
+        server.join().unwrap();
+        result
+    }
+
+    fn contains_io_kind(error: &anyhow::Error, expected: io::ErrorKind) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == expected)
+        })
+    }
+
+    fn chunked_response(body: &[u8], extra_headers: &str) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n{extra_headers}Connection: close\r\n\r\n{:x}\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+        response
+    }
+
+    fn content_length_response(body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn stage_compressed(compressed: &[u8], policy: DownloadPolicy) -> Result<()> {
+        let sha = sha256_hex(compressed);
+        let response = content_length_response(compressed);
+        stage_from_raw_response_with_sha(&response, &sha, policy).0
+    }
+
+    #[test]
+    fn duplicate_content_length_is_rejected() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntest";
+        let error = stage_from_raw_response(response, policy_for_tests())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Content-Length") && error.contains("重复"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn declared_length_must_match_received_body() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\ntest";
+        let error = stage_from_raw_response(response, policy_for_tests()).unwrap_err();
+        assert!(
+            error.to_string().contains("长度") || error.to_string().contains("读取响应失败"),
+            "got: {error:#}"
+        );
+        assert!(
+            contains_io_kind(&error, io::ErrorKind::UnexpectedEof),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn total_timeout_stops_a_non_idle_dribble() {
+        let policy = DownloadPolicy {
+            connect_timeout: Duration::from_millis(200),
+            idle_read_timeout: Duration::from_millis(150),
+            http_timeout: Duration::from_millis(300),
+            max_compressed: 1024,
+            max_uncompressed: 4096,
+        };
+        let error = stage_from_dribbling_server(Duration::from_millis(50), policy).unwrap_err();
+        assert!(
+            error.to_string().contains("读取响应失败") || error.to_string().contains("timed out"),
+            "got: {error:#}"
+        );
+        assert!(
+            contains_io_kind(&error, io::ErrorKind::TimedOut),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn oversized_declared_length_is_rejected_before_body_reads() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 1025\r\nConnection: close\r\n\r\n";
+        let error = stage_from_raw_response(response, policy_for_tests())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Content-Length") && error.contains("1025") && error.contains("1024"),
+            "got: {error}"
+        );
+        assert!(!error.contains("读取响应失败"), "got: {error}");
+    }
+
+    #[test]
+    fn invalid_content_length_is_rejected_before_body_reads() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\nConnection: close\r\n\r\n";
+        let error = stage_from_raw_response(response, policy_for_tests())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("无效 Content-Length") && error.contains("nope"),
+            "got: {error}"
+        );
+        assert!(!error.contains("读取响应失败"), "got: {error}");
+    }
+
+    #[test]
+    fn missing_content_length_uses_received_body_size() {
+        let compressed = gzip(b"test");
+        let sha = sha256_hex(&compressed);
+        let mut response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        response.extend_from_slice(&compressed);
+        stage_from_raw_response_with_sha(&response, &sha, policy_for_tests())
+            .0
+            .unwrap();
+    }
+
+    #[test]
+    fn transfer_encoding_makes_content_length_non_authoritative() {
+        let compressed = gzip(b"test");
+        let sha = sha256_hex(&compressed);
+        let response = chunked_response(&compressed, "Content-Length: 1\r\n");
+        stage_from_raw_response_with_sha(&response, &sha, policy_for_tests())
+            .0
+            .unwrap();
+    }
+
+    #[test]
+    fn chunked_body_is_rejected_at_compressed_limit_plus_one() {
+        let body = vec![b'x'; 1025];
+        let response = chunked_response(&body, "");
+        let error = stage_from_raw_response(&response, policy_for_tests())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("下载数据超过限制") && error.contains("1024"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn idle_body_pause_reports_timeout_with_io_source() {
+        let policy = DownloadPolicy {
+            idle_read_timeout: Duration::from_millis(100),
+            ..policy_for_tests()
+        };
+        let error = stage_from_pausing_server(Duration::from_millis(300), policy).unwrap_err();
+        assert!(error.to_string().contains("读取响应失败"), "got: {error:#}");
+        assert!(
+            contains_io_kind(&error, io::ErrorKind::TimedOut),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn request_disables_transport_content_decoding() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (_, request) =
+            stage_from_raw_response_with_sha(response, &"0".repeat(64), policy_for_tests());
+        let request = String::from_utf8(request).unwrap();
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("Accept-Encoding: identity")),
+            "got request: {request}"
+        );
+    }
+
+    #[test]
+    fn http_status_error_has_stable_download_context() {
+        let response =
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let error = stage_from_raw_response(response, policy_for_tests())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("下载失败") && error.contains("请手动下载"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn total_deadline_is_checked_after_http_status_response() {
+        let policy = DownloadPolicy {
+            idle_read_timeout: Duration::from_millis(300),
+            http_timeout: Duration::from_millis(100),
+            ..policy_for_tests()
+        };
+        let response =
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let error = stage_from_delayed_raw_response(response, Duration::from_millis(150), policy)
+            .unwrap_err();
+        assert!(
+            contains_io_kind(&error, io::ErrorKind::TimedOut),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn unpack_reads_all_concatenated_gzip_members() {
+        let mut compressed = gzip(b"one");
+        compressed.extend_from_slice(&gzip(b"two"));
+        let mut unpacked = Vec::new();
+        assert_eq!(
+            unpack_gzip(Cursor::new(compressed), &mut unpacked, 6).unwrap(),
+            6
+        );
+        assert_eq!(unpacked, b"onetwo");
+    }
+
+    #[test]
+    fn stage_accepts_gzip_at_exact_uncompressed_limit() {
+        let policy = DownloadPolicy {
+            max_uncompressed: 4,
+            ..policy_for_tests()
+        };
+        stage_compressed(&gzip(b"test"), policy).unwrap();
+    }
+
+    #[test]
+    fn truncated_gzip_trailer_is_rejected_during_staging() {
+        let mut compressed = gzip(b"test");
+        compressed.truncate(compressed.len() - 4);
+        let error = stage_compressed(&compressed, policy_for_tests())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("解压 gzip失败"), "got: {error}");
+    }
+
+    #[test]
+    fn modified_gzip_crc_is_rejected_during_staging() {
+        let mut compressed = gzip(b"test");
+        let crc = compressed.len() - 8;
+        compressed[crc] ^= 0xff;
+        let error = stage_compressed(&compressed, policy_for_tests())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("解压 gzip失败"), "got: {error}");
+    }
+
+    #[test]
+    fn trailing_non_gzip_bytes_are_rejected_during_staging() {
+        let mut compressed = gzip(b"test");
+        compressed.extend_from_slice(b"not-gzip");
+        let error = stage_compressed(&compressed, policy_for_tests())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("解压 gzip失败"), "got: {error}");
+    }
 
     #[test]
     fn bounded_copy_accepts_exact_limit_and_rejects_one_more() {
