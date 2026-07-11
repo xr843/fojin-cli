@@ -12,6 +12,69 @@ const MIB: u64 = 1024 * 1024;
 const BUFFER_SIZE: usize = 64 * 1024;
 static ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug)]
+struct ProxyTunnelConnector;
+
+#[derive(Debug)]
+struct ProxyTunnelTransport<T> {
+    inner: T,
+}
+
+impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Connector<T>
+    for ProxyTunnelConnector
+{
+    type Out = ProxyTunnelTransport<T>;
+
+    fn connect(
+        &self,
+        _: &ureq::unversioned::transport::ConnectionDetails<'_>,
+        chained: Option<T>,
+    ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|inner| ProxyTunnelTransport { inner }))
+    }
+}
+
+impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Transport
+    for ProxyTunnelTransport<T>
+{
+    fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> std::result::Result<(), ureq::Error> {
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn maybe_await_input(
+        &mut self,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> std::result::Result<bool, ureq::Error> {
+        self.inner.maybe_await_input(timeout)
+    }
+
+    fn await_input(
+        &mut self,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> std::result::Result<bool, ureq::Error> {
+        self.inner.await_input(timeout)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        // The inner transport may be TLS-secured to an HTTPS proxy, but the
+        // CONNECT tunnel itself is plaintext from the target's perspective.
+        // Report false so the following RustlsConnector adds target TLS.
+        false
+    }
+}
+
 // Ureq's socket adapter turns an already-expired zero timeout into one second
 // because operating systems reject a zero socket timeout. TLS can also perform
 // several lower-level reads for one HTTP-level read while reusing the original
@@ -709,6 +772,7 @@ fn build_agent(
     };
     let connector =
         ().chain(ureq::unversioned::transport::ConnectProxyConnector::default())
+            .chain(ProxyTunnelConnector)
             .chain(ureq::unversioned::transport::TcpConnector::default())
             .chain(deadline_connector)
             .chain(ureq::unversioned::transport::RustlsConnector::default())
@@ -816,6 +880,109 @@ mod tests {
     use flate2::Compression;
     use std::io::{Cursor, Read, Write};
     use std::time::Instant;
+    use ureq::unversioned::transport::Buffers;
+
+    #[derive(Debug)]
+    struct TlsMarkedTransport<T> {
+        inner: T,
+    }
+
+    impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Transport
+        for TlsMarkedTransport<T>
+    {
+        fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+            self.inner.buffers()
+        }
+
+        fn transmit_output(
+            &mut self,
+            amount: usize,
+            timeout: ureq::unversioned::transport::NextTimeout,
+        ) -> std::result::Result<(), ureq::Error> {
+            self.inner.transmit_output(amount, timeout)
+        }
+
+        fn maybe_await_input(
+            &mut self,
+            timeout: ureq::unversioned::transport::NextTimeout,
+        ) -> std::result::Result<bool, ureq::Error> {
+            self.inner.maybe_await_input(timeout)
+        }
+
+        fn await_input(
+            &mut self,
+            timeout: ureq::unversioned::transport::NextTimeout,
+        ) -> std::result::Result<bool, ureq::Error> {
+            self.inner.await_input(timeout)
+        }
+
+        fn is_open(&mut self) -> bool {
+            self.inner.is_open()
+        }
+
+        fn is_tls(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    struct LocalTcpTransport {
+        stream: std::net::TcpStream,
+        buffers: ureq::unversioned::transport::LazyBuffers,
+    }
+
+    impl ureq::unversioned::transport::Transport for LocalTcpTransport {
+        fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(
+            &mut self,
+            amount: usize,
+            _: ureq::unversioned::transport::NextTimeout,
+        ) -> std::result::Result<(), ureq::Error> {
+            let output = &self.buffers.output()[..amount];
+            self.stream.write_all(output).map_err(ureq::Error::Io)
+        }
+
+        fn await_input(
+            &mut self,
+            _: ureq::unversioned::transport::NextTimeout,
+        ) -> std::result::Result<bool, ureq::Error> {
+            let input = self.buffers.input_append_buf();
+            let amount = self.stream.read(input).map_err(ureq::Error::Io)?;
+            self.buffers.input_appended(amount);
+            Ok(amount > 0)
+        }
+
+        fn is_open(&mut self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct FakeTlsProxyConnector {
+        address: std::net::SocketAddr,
+    }
+
+    impl ureq::unversioned::transport::Connector<()> for FakeTlsProxyConnector {
+        type Out = TlsMarkedTransport<LocalTcpTransport>;
+
+        fn connect(
+            &self,
+            _: &ureq::unversioned::transport::ConnectionDetails<'_>,
+            _: Option<()>,
+        ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+            let stream = std::net::TcpStream::connect(self.address).map_err(ureq::Error::Io)?;
+            stream.set_nodelay(true).map_err(ureq::Error::Io)?;
+            Ok(Some(TlsMarkedTransport {
+                inner: LocalTcpTransport {
+                    stream,
+                    buffers: ureq::unversioned::transport::LazyBuffers::new(16 * 1024, 16 * 1024),
+                },
+            }))
+        }
+    }
 
     fn policy_for_tests() -> DownloadPolicy {
         DownloadPolicy {
@@ -825,6 +992,69 @@ mod tests {
             max_compressed: 1024,
             max_uncompressed: 4096,
         }
+    }
+
+    fn first_wire_prefix_through_tls_marked_proxy(target: &str) -> [u8; 5] {
+        use ureq::unversioned::transport::Connector;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut prefix = [0_u8; 5];
+            stream.read_exact(&mut prefix).unwrap();
+            prefix
+        });
+        let connector = ()
+            .chain(FakeTlsProxyConnector { address })
+            .chain(ProxyTunnelConnector)
+            .chain(ureq::unversioned::transport::RustlsConnector::default());
+        let config = ureq::Agent::config_builder()
+            .proxy(None)
+            .timeout_global(Some(Duration::from_secs(2)))
+            .timeout_connect(Some(Duration::from_secs(1)))
+            .build();
+        let agent = ureq::Agent::with_parts(
+            config,
+            connector,
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        );
+
+        let _ = agent.get(target).call();
+        server.join().unwrap()
+    }
+
+    #[test]
+    fn proxy_tunnel_hides_proxy_tls_from_the_target_connector() {
+        use ureq::unversioned::transport::Transport;
+
+        let proxy_tls = TlsMarkedTransport { inner: () };
+        assert!(proxy_tls.is_tls());
+        let tunnel = ProxyTunnelTransport { inner: proxy_tls };
+
+        assert!(!tunnel.is_tls());
+    }
+
+    #[test]
+    fn tls_marked_proxy_still_starts_a_target_tls_handshake() {
+        let prefix = first_wire_prefix_through_tls_marked_proxy("https://127.0.0.1/data.gz");
+
+        assert_eq!(prefix[0], 0x16, "expected TLS handshake, got {prefix:02x?}");
+        assert_eq!(prefix[1], 0x03, "expected TLS version, got {prefix:02x?}");
+        assert!(
+            (0x01..=0x04).contains(&prefix[2]),
+            "expected TLS record version, got {prefix:02x?}"
+        );
+    }
+
+    #[test]
+    fn tls_marked_proxy_keeps_an_http_target_plaintext() {
+        let prefix = first_wire_prefix_through_tls_marked_proxy("http://127.0.0.1/data.gz");
+
+        assert_eq!(&prefix, b"GET /");
     }
 
     #[test]
@@ -1494,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn https_connect_proxy_tls_handshake_obeys_connect_deadline() {
+    fn https_connect_proxy_first_tls_handshake_obeys_connect_deadline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
