@@ -221,12 +221,13 @@ fn stage_candidate_inner(
         .call();
     require_http_deadline(deadline)?;
     let response = response.map_err(|error| {
-        anyhow!(
+        let context = format!(
             "下载失败: {}: {error}\n请手动下载:\n  {}\n解压后放到: {}",
             source.url,
             source.url,
             live_path.display()
-        )
+        );
+        anyhow::Error::new(error).context(context)
     })?;
     let declared = declared_length(&response, policy.max_compressed)?;
     eprintln!("{}", download_notice(declared));
@@ -512,6 +513,36 @@ mod tests {
         result
     }
 
+    fn stage_from_pausing_headers(pause: Duration, policy: DownloadPolicy) -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(pause);
+            let _ = stream.write_all(b"\r\n");
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let url = format!("http://{address}/data.gz");
+        let sha = "0".repeat(64);
+        let result = stage_candidate(
+            &live,
+            &DataSource {
+                url: &url,
+                sha256: &sha,
+            },
+            policy,
+        )
+        .map(drop);
+        server.join().unwrap();
+        result
+    }
+
     fn contains_io_kind(error: &anyhow::Error, expected: io::ErrorKind) -> bool {
         error.chain().any(|cause| {
             cause
@@ -682,6 +713,29 @@ mod tests {
     }
 
     #[test]
+    fn content_encoding_cannot_bypass_wire_length_limit() {
+        let encoded = gzip(b"x");
+        let maximum = encoded.len() as u64 - 1;
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            encoded.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&encoded);
+        let policy = DownloadPolicy {
+            max_compressed: maximum,
+            ..policy_for_tests()
+        };
+        let error = stage_from_raw_response(&response, policy)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Content-Length") && error.contains("超过"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
     fn http_status_error_has_stable_download_context() {
         let response =
             b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -705,6 +759,20 @@ mod tests {
             b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let error = stage_from_delayed_raw_response(response, Duration::from_millis(150), policy)
             .unwrap_err();
+        assert!(
+            contains_io_kind(&error, io::ErrorKind::TimedOut),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn header_idle_timeout_preserves_io_source() {
+        let policy = DownloadPolicy {
+            idle_read_timeout: Duration::from_millis(100),
+            ..policy_for_tests()
+        };
+        let error = stage_from_pausing_headers(Duration::from_millis(300), policy).unwrap_err();
+        assert!(error.to_string().contains("下载失败"), "got: {error:#}");
         assert!(
             contains_io_kind(&error, io::ErrorKind::TimedOut),
             "got: {error:#}"
