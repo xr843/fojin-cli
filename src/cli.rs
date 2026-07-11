@@ -339,14 +339,13 @@ fn run_data(action: DataAction) -> Result<i32> {
         }
         DataAction::Clean { data_dir } => {
             let path = data::resolve_data_path(data_dir)?;
-            // A crashed download can leave a temp sibling; sweep it too.
-            let _ = std::fs::remove_file(path.with_extension("tmp"));
-            if path.exists() {
-                let size = std::fs::metadata(&path)?.len();
-                std::fs::remove_file(&path)?;
-                println!("已删除 {} (释放 {} MB)", path.display(), size / MB);
-            } else {
-                println!("本地无数据,无需清理: {}", path.display());
+            match data::clean_data(&path)? {
+                Some(size) => {
+                    println!("已删除 {} (释放 {} MB)", path.display(), size / MB);
+                }
+                None => {
+                    println!("本地无数据,无需清理: {}", path.display());
+                }
             }
             Ok(0)
         }

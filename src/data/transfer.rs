@@ -167,6 +167,43 @@ fn remove_artifact_family(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn remove_known_artifacts(live_path: &Path) -> Result<()> {
+    let legacy = live_path.with_extension("tmp");
+    match std::fs::remove_file(&legacy) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("删除旧临时数据失败: {}", legacy.display()));
+        }
+    }
+
+    let directory = live_path
+        .parent()
+        .ok_or_else(|| anyhow!("数据路径没有父目录: {}", live_path.display()))?;
+    let file_name = live_path
+        .file_name()
+        .ok_or_else(|| anyhow!("数据路径没有文件名: {}", live_path.display()))?
+        .to_string_lossy();
+    let download_prefix = format!("{file_name}.download.");
+    let candidate_prefix = format!("{file_name}.candidate.");
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("读取数据目录失败: {}", directory.display()))?
+    {
+        let entry = entry.context("读取数据目录项失败")?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&download_prefix) && !name.starts_with(&candidate_prefix) {
+            continue;
+        }
+        if entry.file_type().context("读取临时数据类型失败")?.is_dir() {
+            continue;
+        }
+        std::fs::remove_file(entry.path())
+            .with_context(|| format!("删除临时数据失败: {}", entry.path().display()))?;
+    }
+    Ok(())
+}
+
 fn copy_bounded(
     mut reader: impl Read,
     mut writer: impl Write,

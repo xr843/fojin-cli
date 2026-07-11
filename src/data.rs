@@ -3,6 +3,7 @@ use rusqlite::{OpenFlags, OptionalExtension};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+mod operation_lock;
 mod transfer;
 
 pub const EXPECTED_DATA_VERSION: &str = "v1";
@@ -108,6 +109,10 @@ pub fn ensure_data(path: &Path, offline: bool, source: &DataSource) -> Result<()
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("创建缓存目录失败")?;
     }
+    let _lock = operation_lock::acquire(path, operation_lock::LOCK_WAIT_TIMEOUT)?;
+    if path.exists() {
+        return Ok(());
+    }
     install_candidate(path, source)
 }
 
@@ -118,7 +123,25 @@ pub fn update_data(path: &Path, source: &DataSource) -> Result<()> {
         std::fs::create_dir_all(parent).context("创建缓存目录失败")?;
     }
 
+    let _lock = operation_lock::acquire(path, operation_lock::LOCK_WAIT_TIMEOUT)?;
     install_candidate(path, source)
+}
+
+pub fn clean_data(path: &Path) -> Result<Option<u64>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("创建缓存目录失败")?;
+    }
+    let _lock = operation_lock::acquire(path, operation_lock::LOCK_WAIT_TIMEOUT)?;
+    transfer::remove_known_artifacts(path)?;
+    let size = match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("读取数据文件状态失败"),
+    };
+    if size.is_some() {
+        std::fs::remove_file(path).with_context(|| format!("删除数据失败: {}", path.display()))?;
+    }
+    Ok(size)
 }
 
 fn install_candidate(path: &Path, source: &DataSource<'_>) -> Result<()> {
