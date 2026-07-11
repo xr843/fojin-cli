@@ -1,0 +1,85 @@
+name: Bug report
+description: Report a reproducible fojin-cli defect
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve fojin-cli. Search existing issues before filing.
+
+        **Do not disclose security vulnerabilities here.** Use the private process in [SECURITY.md](https://github.com/xr843/fojin-cli/blob/master/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: fojin version
+      description: Paste the output of `fojin --version`.
+      placeholder: "fojin 0.x.y"
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - cargo install
+        - install.sh
+        - GitHub Release archive
+        - Built from source
+        - Other package or integration
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and architecture
+      placeholder: "Ubuntu 24.04 x86_64, macOS arm64, or Windows x64"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and input
+      description: Provide the smallest command/input that reproduces the problem. Remove private data.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include exact output and exit code when useful. Remove credentials and private data.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Include whether the issue also occurs with `--offline` or a fresh `--data-dir`, when relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: data_status
+    attributes:
+      label: Dataset status
+      description: For data/query issues, paste `fojin data status` and `fojin data verify` output. Do not attach the dataset itself.
+      render: text
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add minimal logs or screenshots that do not contain sensitive information.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched for an existing report of this issue.
+          required: true
+        - label: This report does not disclose a security vulnerability or sensitive data.
+          required: true
