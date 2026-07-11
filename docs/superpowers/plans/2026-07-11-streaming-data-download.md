@@ -16,7 +16,9 @@
 - First install and update both run schema/version, quick-check, and FTS integrity validation before publish.
 - Existing data remains byte-for-byte unchanged on every failure before atomic publish.
 - Ordinary queries never wait for the long-running mutation lock.
-- Temporary files are same-directory, `create_new` siblings owned and cleaned by one operation.
+- Temporary files are same-directory, `create_new` siblings reserved and
+  cleaned by one cooperating operation; this is not an adversarial same-user
+  filesystem boundary.
 - Do not add retries, resume support, mirrors, data discovery, schema changes, a tag, or a GitHub Release.
 - Use TDD, focused commits, independent review, PR checks, and merge to `master`.
 

@@ -127,9 +127,16 @@ artifact role, process ID, and an atomic sequence, and are opened with
 - `data.sqlite.download.<pid>.<sequence>.gz`
 - `data.sqlite.candidate.<pid>.<sequence>`
 
-An ownership guard removes only artifacts created by the current operation.
-It is disarmed only after a successful publish or an intentional Windows
-preservation result. Recoverable errors never sweep another process's files.
+Within the cooperating-process model enforced by the operation lock, an
+ownership guard removes the unique artifact family reserved by the current
+operation. It is disarmed only after a successful publish or an intentional
+Windows preservation result. Pre-existing family collisions are skipped, so
+recoverable errors do not sweep another cooperating operation's files.
+
+The same coordination model applies to SQLite sidecars and Windows replacement
+backups. `create_new` reservations and post-reservation checks are not a
+security boundary against another same-user process that can concurrently
+modify the data directory; filesystem permissions remain that boundary.
 
 ## Detailed Data Flow
 

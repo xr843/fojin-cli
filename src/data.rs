@@ -368,6 +368,9 @@ impl Drop for ReplacementBackupReservation {
 fn reserve_replacement_backup(live_path: &Path) -> Result<ReplacementBackupReservation> {
     use std::sync::atomic::Ordering;
 
+    // create_new avoids stale-name collisions between cooperating fojin
+    // operations. The reservation is not a security boundary against another
+    // same-user process that can alter this directory concurrently.
     loop {
         let sequence = REPLACEMENT_BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = sibling_path(

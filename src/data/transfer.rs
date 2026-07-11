@@ -6,41 +6,52 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 const MIB: u64 = 1024 * 1024;
 const BUFFER_SIZE: usize = 64 * 1024;
 static ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 // Ureq's socket adapter turns an already-expired zero timeout into one second
-// because operating systems reject a zero socket timeout. Reject it before the
-// adapter instead, including when protocol bytes are already buffered, so the
-// configured global deadline remains a hard boundary under byte dribbling.
-// The transport API is unversioned, so ureq is pinned exactly in Cargo.toml.
-#[derive(Debug)]
-struct StrictTimeoutConnector;
+// because operating systems reject a zero socket timeout. TLS can also perform
+// several lower-level reads for one HTTP-level read while reusing the original
+// timeout. Recompute the absolute deadline and the per-read idle timeout at
+// both transport layers so neither buffered protocol bytes nor a dribbling TLS
+// record can extend the configured boundary. The transport API is unversioned,
+// so ureq is pinned exactly in Cargo.toml.
+#[derive(Clone, Copy, Debug)]
+struct AbsoluteDeadlineConnector {
+    deadline: StdInstant,
+    idle_read_timeout: Duration,
+}
 
 #[derive(Debug)]
-struct StrictTimeoutTransport<T> {
+struct AbsoluteDeadlineTransport<T> {
     inner: T,
+    deadline: StdInstant,
+    idle_read_timeout: Duration,
 }
 
 impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Connector<T>
-    for StrictTimeoutConnector
+    for AbsoluteDeadlineConnector
 {
-    type Out = StrictTimeoutTransport<T>;
+    type Out = AbsoluteDeadlineTransport<T>;
 
     fn connect(
         &self,
         _: &ureq::unversioned::transport::ConnectionDetails<'_>,
         chained: Option<T>,
     ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
-        Ok(chained.map(|inner| StrictTimeoutTransport { inner }))
+        Ok(chained.map(|inner| AbsoluteDeadlineTransport {
+            inner,
+            deadline: self.deadline,
+            idle_read_timeout: self.idle_read_timeout,
+        }))
     }
 }
 
 impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Transport
-    for StrictTimeoutTransport<T>
+    for AbsoluteDeadlineTransport<T>
 {
     fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
         self.inner.buffers()
@@ -51,6 +62,7 @@ impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::T
         amount: usize,
         timeout: ureq::unversioned::transport::NextTimeout,
     ) -> std::result::Result<(), ureq::Error> {
+        let timeout = bound_transport_timeout(timeout, self.deadline, None);
         require_remaining_timeout(timeout)?;
         self.inner.transmit_output(amount, timeout)
     }
@@ -59,6 +71,7 @@ impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::T
         &mut self,
         timeout: ureq::unversioned::transport::NextTimeout,
     ) -> std::result::Result<bool, ureq::Error> {
+        let timeout = bound_transport_timeout(timeout, self.deadline, Some(self.idle_read_timeout));
         require_remaining_timeout(timeout)?;
         self.inner.maybe_await_input(timeout)
     }
@@ -67,6 +80,7 @@ impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::T
         &mut self,
         timeout: ureq::unversioned::transport::NextTimeout,
     ) -> std::result::Result<bool, ureq::Error> {
+        let timeout = bound_transport_timeout(timeout, self.deadline, Some(self.idle_read_timeout));
         require_remaining_timeout(timeout)?;
         self.inner.await_input(timeout)
     }
@@ -80,11 +94,46 @@ impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::T
     }
 }
 
+fn bound_transport_timeout(
+    mut timeout: ureq::unversioned::transport::NextTimeout,
+    deadline: StdInstant,
+    idle_read_timeout: Option<Duration>,
+) -> ureq::unversioned::transport::NextTimeout {
+    let remaining = deadline.saturating_duration_since(StdInstant::now());
+    let global_after: ureq::unversioned::transport::time::Duration = remaining.into();
+    if global_after < timeout.after {
+        timeout = ureq::unversioned::transport::NextTimeout {
+            after: global_after,
+            reason: ureq::Timeout::Global,
+        };
+    }
+
+    if let Some(idle_read_timeout) = idle_read_timeout {
+        let idle_after: ureq::unversioned::transport::time::Duration = idle_read_timeout.into();
+        if idle_after < timeout.after {
+            timeout = ureq::unversioned::transport::NextTimeout {
+                after: idle_after,
+                reason: ureq::Timeout::RecvResponse,
+            };
+        }
+    }
+
+    timeout
+}
+
 fn require_remaining_timeout(
     timeout: ureq::unversioned::transport::NextTimeout,
 ) -> std::result::Result<(), ureq::Error> {
     if !timeout.after.is_not_happening() && timeout.after.is_zero() {
         Err(ureq::Error::Timeout(timeout.reason))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_absolute_deadline(deadline: StdInstant) -> std::result::Result<(), ureq::Error> {
+    if StdInstant::now() >= deadline {
+        Err(ureq::Error::Timeout(ureq::Timeout::Global))
     } else {
         Ok(())
     }
@@ -254,11 +303,12 @@ where
         }
     };
 
-    // The main file reserves this generation. Recheck the sidecars after that
-    // reservation so a stale family can never be claimed and later deleted by
-    // this guard. Under the data-operation lock, any sidecar that appears after
-    // this point can only be produced by SQLite while operating on this unique
-    // candidate.
+    // The main file reserves this generation for cooperating fojin processes.
+    // Recheck the sidecars so a stale family is not claimed and later deleted
+    // by this guard. After this point, the operation lock ensures cooperating
+    // processes leave this unique family to SQLite. This naming protocol is
+    // coordination, not isolation from a same-user process that can modify the
+    // data directory concurrently.
     let sidecar_occupied = sidecars.iter().try_fold(false, |occupied, sidecar| {
         entry_exists(sidecar).map(|exists| occupied || exists)
     });
@@ -425,10 +475,23 @@ pub(super) fn stage_candidate(
     let staged = stage_candidate_inner(live_path, source, policy, &mut compressed_file);
     match staged {
         Ok(candidate) => {
-            compressed_guard.remove_now()?;
-            Ok(candidate)
+            finish_successful_stage_with(compressed_guard, candidate, OwnedCompressed::remove_now)
         }
         Err(error) => Err(compressed_guard.cleanup_with(error)),
+    }
+}
+
+fn finish_successful_stage_with<RemoveCompressed>(
+    compressed_guard: OwnedCompressed,
+    candidate: StagedCandidate,
+    remove_compressed: RemoveCompressed,
+) -> Result<StagedCandidate>
+where
+    RemoveCompressed: FnOnce(OwnedCompressed) -> Result<()>,
+{
+    match remove_compressed(compressed_guard) {
+        Ok(()) => Ok(candidate),
+        Err(error) => Err(candidate.cleanup_with(error)),
     }
 }
 
@@ -438,6 +501,9 @@ fn stage_candidate_inner(
     policy: DownloadPolicy,
     compressed_file: &mut File,
 ) -> Result<StagedCandidate> {
+    let deadline = StdInstant::now()
+        .checked_add(policy.http_timeout)
+        .ok_or_else(|| anyhow!("HTTP 总超时超出系统时间范围"))?;
     let config = ureq::Agent::config_builder()
         .max_redirects(5)
         .max_redirects_will_error(true)
@@ -446,12 +512,19 @@ fn stage_candidate_inner(
         .timeout_global(Some(policy.http_timeout))
         .timeout_resolve(Some(policy.connect_timeout))
         .timeout_connect(Some(policy.connect_timeout))
-        .timeout_recv_response(Some(policy.idle_read_timeout))
         .timeout_recv_body(Some(policy.idle_read_timeout))
         .build();
     use ureq::unversioned::transport::Connector;
+    let deadline_connector = AbsoluteDeadlineConnector {
+        deadline,
+        idle_read_timeout: policy.idle_read_timeout,
+    };
     let connector =
-        ureq::unversioned::transport::DefaultConnector::new().chain(StrictTimeoutConnector);
+        ().chain(ureq::unversioned::transport::ConnectProxyConnector::default())
+            .chain(ureq::unversioned::transport::TcpConnector::default())
+            .chain(deadline_connector)
+            .chain(ureq::unversioned::transport::RustlsConnector::default())
+            .chain(deadline_connector);
     let agent = ureq::Agent::with_parts(
         config,
         connector,
@@ -476,13 +549,29 @@ fn stage_candidate_inner(
     let mut received = 0_u64;
     let mut buffer = [0_u8; BUFFER_SIZE];
     loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(normalize_body_read_error)
-            .map_err(anyhow::Error::new)
+        require_absolute_deadline(deadline)
+            .map_err(normalize_ureq_error)
             .map_err(|error| {
                 download_error_context(error, "读取响应失败", live_path, source.url)
             })?;
+        let count = match reader.read(&mut buffer) {
+            Ok(count) => {
+                require_absolute_deadline(deadline)
+                    .map_err(normalize_ureq_error)
+                    .map_err(|error| {
+                        download_error_context(error, "读取响应失败", live_path, source.url)
+                    })?;
+                count
+            }
+            Err(error) => {
+                return Err(download_error_context(
+                    anyhow::Error::new(normalize_body_read_error(error)),
+                    "读取响应失败",
+                    live_path,
+                    source.url,
+                ));
+            }
+        };
         if count == 0 {
             break;
         }
@@ -678,6 +767,35 @@ mod tests {
             "got: {error:#}"
         );
         assert!(!candidate.exists(), "owned candidate main leaked");
+    }
+
+    #[test]
+    fn compressed_removal_failure_attaches_candidate_cleanup_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let compressed_path = directory.path().join("data.sqlite.download.123.4.gz");
+        std::fs::write(&compressed_path, b"compressed").unwrap();
+        let compressed_guard = OwnedCompressed {
+            path: compressed_path,
+            armed: true,
+        };
+        let candidate_path = directory.path().join("data.sqlite.candidate.123.4");
+        std::fs::create_dir(&candidate_path).unwrap();
+        let candidate = StagedCandidate::for_test(candidate_path);
+
+        let result = finish_successful_stage_with(compressed_guard, candidate, |_| {
+            Err(anyhow!("injected compressed removal failure"))
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("compressed removal failure was ignored"),
+        };
+        let detail = format!("{error:#}");
+
+        assert!(
+            detail.contains("injected compressed removal failure"),
+            "got: {detail}"
+        );
+        assert!(detail.contains("清理候选数据失败"), "got: {detail}");
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
@@ -913,6 +1031,38 @@ mod tests {
         })
     }
 
+    fn contains_ureq_timeout(error: &anyhow::Error, expected: ureq::Timeout) -> bool {
+        error.chain().any(|cause| {
+            let direct = matches!(
+                cause.downcast_ref::<ureq::Error>(),
+                Some(ureq::Error::Timeout(reason)) if *reason == expected
+            );
+            let wrapped = cause
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::get_ref)
+                .and_then(|source| source.downcast_ref::<ureq::Error>())
+                .is_some_and(
+                    |source| matches!(source, ureq::Error::Timeout(reason) if *reason == expected),
+                );
+            direct || wrapped
+        })
+    }
+
+    fn assert_no_owned_transfer_artifacts(live: &Path) {
+        let live_name = live.file_name().unwrap().to_string_lossy();
+        let owned: Vec<_> = std::fs::read_dir(live.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| {
+                is_owned_artifact_name(live_name.as_ref(), name.to_string_lossy().as_ref())
+            })
+            .collect();
+        assert!(
+            owned.is_empty(),
+            "owned transfer artifacts remain: {owned:?}"
+        );
+    }
+
     fn chunked_response(body: &[u8], extra_headers: &str) -> Vec<u8> {
         let mut response = format!(
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n{extra_headers}Connection: close\r\n\r\n{:x}\r\n",
@@ -988,6 +1138,111 @@ mod tests {
             contains_io_kind(&error, io::ErrorKind::TimedOut),
             "got: {error:#}"
         );
+    }
+
+    #[test]
+    fn slow_progressing_valid_body_can_outlive_the_idle_window() {
+        let compressed = gzip(b"slow valid body");
+        let sha = sha256_hex(&compressed);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_body = compressed.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nodelay(true).unwrap();
+            let _ = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_body.len()
+            )
+            .unwrap();
+            for (index, byte) in server_body.iter().enumerate() {
+                stream.write_all(std::slice::from_ref(byte)).unwrap();
+                stream.flush().unwrap();
+                if index + 1 < server_body.len() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let url = format!("http://{address}/data.gz");
+        let policy = DownloadPolicy {
+            connect_timeout: Duration::from_millis(500),
+            idle_read_timeout: Duration::from_millis(120),
+            http_timeout: Duration::from_secs(2),
+            max_compressed: 1024,
+            max_uncompressed: 4096,
+        };
+
+        let candidate = stage_candidate(
+            &live,
+            &DataSource {
+                url: &url,
+                sha256: &sha,
+            },
+            policy,
+        )
+        .expect("continuously progressing body should not hit the idle timeout");
+        server.join().unwrap();
+
+        assert_eq!(std::fs::read(candidate.path()).unwrap(), b"slow valid body");
+    }
+
+    #[test]
+    fn global_deadline_interrupts_a_dribbling_tls_record() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nodelay(true).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut client_hello = [0_u8; 16 * 1024];
+            let _ = stream.read(&mut client_hello).unwrap();
+            stream.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).unwrap();
+            stream.flush().unwrap();
+            for _ in 0..24 {
+                if stream.write_all(&[0]).is_err() || stream.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let url = format!("https://{address}/data.gz");
+        let sha = "0".repeat(64);
+        let policy = DownloadPolicy {
+            connect_timeout: Duration::from_secs(1),
+            idle_read_timeout: Duration::from_secs(1),
+            http_timeout: Duration::from_millis(250),
+            max_compressed: 1024,
+            max_uncompressed: 4096,
+        };
+
+        let started = Instant::now();
+        let error = stage_candidate(
+            &live,
+            &DataSource {
+                url: &url,
+                sha256: &sha,
+            },
+            policy,
+        )
+        .map(drop)
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(elapsed < Duration::from_millis(700), "elapsed: {elapsed:?}");
+        assert!(
+            contains_ureq_timeout(&error, ureq::Timeout::Global),
+            "got: {error:#}"
+        );
+        assert_no_owned_transfer_artifacts(&live);
     }
 
     #[test]
@@ -1205,6 +1460,10 @@ mod tests {
         assert!(error.to_string().contains("下载失败"), "got: {error:#}");
         assert!(
             contains_io_kind(&error, io::ErrorKind::TimedOut),
+            "got: {error:#}"
+        );
+        assert!(
+            contains_ureq_timeout(&error, ureq::Timeout::RecvResponse),
             "got: {error:#}"
         );
     }
