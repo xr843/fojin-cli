@@ -1,7 +1,7 @@
 use fojin_cli::data::{
     ensure_data, gunzip, open_compatible_db, open_read_only_db, resolve_data_path, update_data,
-    validate_compatibility, verify_dataset, verify_sha256, DataSource, EXPECTED_DATA_VERSION,
-    EXPECTED_NORM_RULESET,
+    validate_compatibility, verify_dataset, verify_dataset_file, verify_sha256, DataSource,
+    EXPECTED_DATA_VERSION, EXPECTED_NORM_RULESET,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -106,17 +106,11 @@ fn download_notice_mentions_size_and_offline() {
 }
 
 /// Serve one HTTP response on localhost and exercise the full download path:
-/// stream -> sha256 verify -> gunzip -> atomic write. No external network.
+/// stream -> sha256 verify -> bounded gunzip -> verified publication. No external network.
 #[test]
 fn ensure_data_downloads_verifies_and_unpacks() {
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(b"fake sqlite payload").unwrap();
-    let gz = enc.finish().unwrap();
-
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(&gz);
-    let sha: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let gz = gzip_bytes(&replacement_database_bytes());
+    let sha = sha256_hex(&gz);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -142,11 +136,41 @@ fn ensure_data_downloads_verifies_and_unpacks() {
     ensure_data(&path, false, &source).unwrap();
     server.join().unwrap();
 
-    assert_eq!(std::fs::read(&path).unwrap(), b"fake sqlite payload");
-    assert!(
-        !path.with_extension("tmp").exists(),
-        "temp file must not linger"
-    );
+    verify_dataset_file(&path).unwrap();
+}
+
+#[test]
+fn first_install_rejects_incompatible_database() {
+    let gz = gzip_bytes(b"fake sqlite payload");
+    let sha = sha256_hex(&gz);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = gz.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let _ = std::io::Read::read(&mut stream, &mut request);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/gzip\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    let source = DataSource {
+        url: &format!("http://127.0.0.1:{port}/data.gz"),
+        sha256: &sha,
+    };
+    let error = ensure_data(&path, false, &source).unwrap_err().to_string();
+    server.join().unwrap();
+
+    assert!(error.contains("dataset incompatibility"), "got: {error}");
+    assert!(!path.exists(), "incompatible dataset was published");
+    assert_no_owned_candidate_artifacts(&path);
 }
 
 #[test]
@@ -561,7 +585,7 @@ fn update_data_preserves_live_dataset_on_decompression_failure() {
         .unwrap_err()
         .to_string();
 
-    assert!(err.contains("解压 gzip 失败"), "got: {err}");
+    assert!(err.contains("解压 gzip"), "got: {err}");
     assert_eq!(std::fs::read(&path).unwrap(), b"old live dataset");
     assert_no_candidate_artifacts(&path);
 }

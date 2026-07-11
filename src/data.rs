@@ -1,18 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{OpenFlags, OptionalExtension};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
-/// Connect timeout for the data download: fails fast if the release host is
-/// unreachable rather than hanging forever.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Overall read ceiling for the data download. The artifact is ~100-200MB,
-/// so this is generous for a slow-but-alive connection while still
-/// guaranteeing the CLI can never hang indefinitely.
-const READ_TIMEOUT: Duration = Duration::from_secs(900);
-static CANDIDATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+mod transfer;
 
 pub const EXPECTED_DATA_VERSION: &str = "v1";
 pub const EXPECTED_NORM_RULESET: &str = "t2s-char-1to1-v1";
@@ -117,8 +108,7 @@ pub fn ensure_data(path: &Path, offline: bool, source: &DataSource) -> Result<()
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("创建缓存目录失败")?;
     }
-    let raw = download_and_unpack(path, source)?;
-    write_atomic(path, &raw)
+    install_candidate(path, source)
 }
 
 /// Download a replacement dataset to a sibling candidate, validate it, then
@@ -128,40 +118,25 @@ pub fn update_data(path: &Path, source: &DataSource) -> Result<()> {
         std::fs::create_dir_all(parent).context("创建缓存目录失败")?;
     }
 
-    let raw = download_and_unpack(path, source)?;
-    let (candidate, mut candidate_file) = create_candidate(path)?;
-    let write_result = candidate_file
-        .write_all(&raw)
-        .with_context(|| format!("写入候选数据失败: {}", candidate.display()));
-    drop(candidate_file);
-    if let Err(error) = write_result {
-        return Err(cleanup_candidate_error(&candidate, error));
-    }
-
-    let validation_result = verify_dataset_file(&candidate).map(|_| ());
-    if let Err(error) = validation_result {
-        return Err(cleanup_candidate_error(&candidate, error));
-    }
-
-    finish_replacement(&candidate, replace_with_candidate(path, &candidate))
+    install_candidate(path, source)
 }
 
-fn download_and_unpack(path: &Path, source: &DataSource) -> Result<Vec<u8>> {
-    let gz = http_get(source.url).map_err(|e| {
-        anyhow!(
-            "{e:#}\n请手动下载:\n  {}\n解压后放到: {}",
-            source.url,
-            path.display()
-        )
-    })?;
-    if !verify_sha256(&gz, source.sha256) {
-        return Err(anyhow!(
-            "下载校验失败(sha256 不符)。请重试或手动下载:\n  {}\n解压后放到: {}",
-            source.url,
-            path.display()
-        ));
+fn install_candidate(path: &Path, source: &DataSource<'_>) -> Result<()> {
+    let candidate = transfer::stage_candidate(path, source, transfer::PRODUCTION_POLICY)?;
+    if let Err(error) = verify_dataset_file(candidate.path()).map(|_| ()) {
+        return Err(candidate.cleanup_with(error));
     }
-    gunzip(&gz)
+    if let Err(error) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(candidate.path())
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("同步候选数据失败: {}", candidate.path().display()))
+    {
+        return Err(candidate.cleanup_with(error));
+    }
+    let candidate_path = candidate.path().to_path_buf();
+    finish_replacement(candidate, replace_with_candidate(path, &candidate_path))
 }
 
 fn sibling_path(path: &Path, suffix: &str) -> Result<PathBuf> {
@@ -171,33 +146,6 @@ fn sibling_path(path: &Path, suffix: &str) -> Result<PathBuf> {
     let mut sibling = file_name.to_os_string();
     sibling.push(suffix);
     Ok(path.with_file_name(sibling))
-}
-
-fn create_candidate(path: &Path) -> Result<(PathBuf, std::fs::File)> {
-    loop {
-        let sequence = CANDIDATE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let suffix = format!(".candidate.{}.{sequence}", std::process::id());
-        let candidate = sibling_path(path, &suffix)?;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => return Ok((candidate, file)),
-            Err(ref error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("创建候选数据失败: {}", candidate.display()))
-            }
-        }
-    }
-}
-
-fn cleanup_candidate_error(candidate: &Path, error: anyhow::Error) -> anyhow::Error {
-    match remove_candidate_artifacts(candidate) {
-        Ok(()) => error,
-        Err(cleanup_error) => error.context(format!("清理候选数据失败: {cleanup_error}")),
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,39 +180,28 @@ impl ReplacementFailure {
 
 type ReplacementResult = std::result::Result<(), ReplacementFailure>;
 
-fn finish_replacement(candidate: &Path, result: ReplacementResult) -> Result<()> {
+fn finish_replacement(
+    candidate: transfer::StagedCandidate,
+    result: ReplacementResult,
+) -> Result<()> {
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            candidate.publish_succeeded();
+            Ok(())
+        }
         Err(failure) => match failure.cleanup {
-            CandidateCleanupPolicy::Remove => {
-                Err(cleanup_candidate_error(candidate, failure.error))
-            }
+            CandidateCleanupPolicy::Remove => Err(candidate.cleanup_with(failure.error)),
             #[cfg(any(test, windows))]
-            CandidateCleanupPolicy::Preserve => Err(failure.error.context(format!(
-                "validated candidate preserved at `{}`",
-                candidate.display()
-            ))),
+            CandidateCleanupPolicy::Preserve => {
+                let candidate_path = candidate.path().to_path_buf();
+                candidate.preserve();
+                Err(failure.error.context(format!(
+                    "validated candidate preserved at `{}`",
+                    candidate_path.display()
+                )))
+            }
         },
     }
-}
-
-fn remove_candidate_artifacts(candidate: &Path) -> Result<()> {
-    for suffix in ["", "-journal", "-shm", "-wal"] {
-        let artifact = if suffix.is_empty() {
-            candidate.to_path_buf()
-        } else {
-            sibling_path(candidate, suffix)?
-        };
-        match std::fs::remove_file(&artifact) {
-            Ok(()) => {}
-            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("删除候选数据失败: {}", artifact.display()))
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -414,34 +351,6 @@ fn describe_windows_error(error: &std::io::Error) -> String {
         Some(code) => format!("Windows error {code}: {error}"),
         None => error.to_string(),
     }
-}
-
-fn http_get(url: &str) -> Result<Vec<u8>> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(READ_TIMEOUT)
-        .build();
-    let resp = agent
-        .get(url)
-        .call()
-        .with_context(|| format!("下载失败: {url}"))?;
-    let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
-    eprintln!("{}", download_notice(total));
-    let mut progress = Progress::new(total);
-    let mut reader = resp.into_reader();
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let n = reader.read(&mut chunk).context("读取响应失败")?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(msg) = progress.advance(n as u64) {
-            eprintln!("{msg}");
-        }
-    }
-    Ok(buf)
 }
 
 pub fn open_db(path: &Path) -> Result<rusqlite::Connection> {
@@ -681,9 +590,10 @@ mod replacement_cleanup_tests {
         let dir = tempfile::tempdir().unwrap();
         let candidate = dir.path().join("data.sqlite.candidate.1.1");
         std::fs::write(&candidate, b"validated dataset").unwrap();
+        let staged = transfer::StagedCandidate::for_test(candidate.clone());
 
         let error = finish_replacement(
-            &candidate,
+            staged,
             Err(ReplacementFailure::preserve(anyhow!(
                 "replacement recovery failed"
             ))),
