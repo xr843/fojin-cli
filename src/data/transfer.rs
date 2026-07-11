@@ -76,12 +76,28 @@ impl<T> AbsoluteDeadlineTransport<T> {
         timeout: ureq::unversioned::transport::NextTimeout,
         idle_read_timeout: Option<Duration>,
     ) -> std::result::Result<ureq::unversioned::transport::NextTimeout, ureq::Error> {
-        let now = StdInstant::now();
+        self.bound_timeout_at(timeout, idle_read_timeout, StdInstant::now())
+    }
+
+    fn bound_timeout_at(
+        &mut self,
+        timeout: ureq::unversioned::transport::NextTimeout,
+        idle_read_timeout: Option<Duration>,
+        now: StdInstant,
+    ) -> std::result::Result<ureq::unversioned::transport::NextTimeout, ureq::Error> {
+        // ConnectProxyConnector drives its TransportAdapter with this sentinel
+        // while TLS-to-proxy and CONNECT are still part of the active connect
+        // phase. It may preserve an existing phase, but must never start one.
+        let connect_proxy_sentinel = self.connect_phase_active
+            && timeout.reason == ureq::Timeout::Global
+            && timeout.after.is_not_happening();
         let connect_deadline = if timeout.reason == ureq::Timeout::Connect {
             if !self.connect_phase_active {
                 self.connect_phase_deadline = checked_deadline(now, self.connect_timeout)?;
                 self.connect_phase_active = true;
             }
+            Some(self.connect_phase_deadline)
+        } else if connect_proxy_sentinel {
             Some(self.connect_phase_deadline)
         } else {
             self.connect_phase_active = false;
@@ -586,23 +602,7 @@ fn stage_candidate_inner(
         .timeout_connect(Some(policy.connect_timeout))
         .timeout_recv_body(Some(policy.idle_read_timeout))
         .build();
-    use ureq::unversioned::transport::Connector;
-    let deadline_connector = AbsoluteDeadlineConnector {
-        deadline,
-        connect_timeout: policy.connect_timeout,
-        idle_read_timeout: policy.idle_read_timeout,
-    };
-    let connector =
-        ().chain(ureq::unversioned::transport::ConnectProxyConnector::default())
-            .chain(ureq::unversioned::transport::TcpConnector::default())
-            .chain(deadline_connector)
-            .chain(ureq::unversioned::transport::RustlsConnector::default())
-            .chain(deadline_connector);
-    let agent = ureq::Agent::with_parts(
-        config,
-        connector,
-        ureq::unversioned::resolver::DefaultResolver::default(),
-    );
+    let agent = build_agent(config, policy, deadline);
     let mut response = agent
         .get(source.url)
         .header("Accept-Encoding", "identity")
@@ -694,6 +694,30 @@ fn stage_candidate_inner(
         Ok(()) => Ok(candidate_guard),
         Err(error) => Err(candidate_guard.cleanup_with(error)),
     }
+}
+
+fn build_agent(
+    config: ureq::config::Config,
+    policy: DownloadPolicy,
+    deadline: StdInstant,
+) -> ureq::Agent {
+    use ureq::unversioned::transport::Connector;
+    let deadline_connector = AbsoluteDeadlineConnector {
+        deadline,
+        connect_timeout: policy.connect_timeout,
+        idle_read_timeout: policy.idle_read_timeout,
+    };
+    let connector =
+        ().chain(ureq::unversioned::transport::ConnectProxyConnector::default())
+            .chain(ureq::unversioned::transport::TcpConnector::default())
+            .chain(deadline_connector)
+            .chain(ureq::unversioned::transport::RustlsConnector::default())
+            .chain(deadline_connector);
+    ureq::Agent::with_parts(
+        config,
+        connector,
+        ureq::unversioned::resolver::DefaultResolver::default(),
+    )
 }
 
 fn download_error_context(
@@ -869,6 +893,92 @@ mod tests {
             "got: {detail}"
         );
         assert!(detail.contains("清理候选数据失败"), "got: {detail}");
+    }
+
+    #[test]
+    fn connect_proxy_sentinel_keeps_the_original_connection_deadline() {
+        let started = Instant::now();
+        let original_connect_deadline = started + Duration::from_millis(250);
+        let mut transport = AbsoluteDeadlineTransport {
+            inner: (),
+            deadline: started + Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(250),
+            connect_phase_deadline: original_connect_deadline,
+            connect_phase_active: true,
+            idle_read_timeout: Duration::from_secs(1),
+        };
+        let sentinel = ureq::unversioned::transport::NextTimeout {
+            after: ureq::unversioned::transport::time::Duration::NotHappening,
+            reason: ureq::Timeout::Global,
+        };
+
+        let first = transport
+            .bound_timeout_at(sentinel, None, started + Duration::from_millis(100))
+            .unwrap();
+        let expected_first: ureq::unversioned::transport::time::Duration =
+            Duration::from_millis(150).into();
+        assert_eq!(first.reason, ureq::Timeout::Connect);
+        assert_eq!(first.after, expected_first);
+        assert!(transport.connect_phase_active);
+        assert_eq!(transport.connect_phase_deadline, original_connect_deadline);
+
+        let second = transport
+            .bound_timeout_at(sentinel, None, started + Duration::from_millis(200))
+            .unwrap();
+        let expected_second: ureq::unversioned::transport::time::Duration =
+            Duration::from_millis(50).into();
+        assert_eq!(second.reason, ureq::Timeout::Connect);
+        assert_eq!(second.after, expected_second);
+        assert!(transport.connect_phase_active);
+        assert_eq!(transport.connect_phase_deadline, original_connect_deadline);
+    }
+
+    #[test]
+    fn finite_non_connect_timeout_ends_then_connect_restarts_the_phase() {
+        let started = Instant::now();
+        let mut transport = AbsoluteDeadlineTransport {
+            inner: (),
+            deadline: started + Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(250),
+            connect_phase_deadline: started + Duration::from_millis(250),
+            connect_phase_active: true,
+            idle_read_timeout: Duration::from_secs(1),
+        };
+        let finite_global = ureq::unversioned::transport::NextTimeout {
+            after: Duration::from_millis(500).into(),
+            reason: ureq::Timeout::Global,
+        };
+
+        let finite = transport
+            .bound_timeout_at(finite_global, None, started + Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(finite.reason, ureq::Timeout::Global);
+        assert!(!transport.connect_phase_active);
+
+        let sentinel = ureq::unversioned::transport::NextTimeout {
+            after: ureq::unversioned::transport::time::Duration::NotHappening,
+            reason: ureq::Timeout::Global,
+        };
+        let sentinel = transport
+            .bound_timeout_at(sentinel, None, started + Duration::from_millis(100))
+            .unwrap();
+        assert_eq!(sentinel.reason, ureq::Timeout::Global);
+        assert!(!transport.connect_phase_active);
+
+        let restarted_at = started + Duration::from_millis(200);
+        let connect = ureq::unversioned::transport::NextTimeout {
+            after: Duration::from_millis(250).into(),
+            reason: ureq::Timeout::Connect,
+        };
+        let connect = transport
+            .bound_timeout_at(connect, None, restarted_at)
+            .unwrap();
+        assert_eq!(connect.reason, ureq::Timeout::Connect);
+        assert!(transport.connect_phase_active);
+        assert_eq!(
+            transport.connect_phase_deadline,
+            restarted_at + Duration::from_millis(250)
+        );
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
@@ -1381,6 +1491,66 @@ mod tests {
             "got: {error:#}"
         );
         assert_no_owned_transfer_artifacts(&live);
+    }
+
+    #[test]
+    fn https_connect_proxy_tls_handshake_obeys_connect_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nodelay(true).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut client_hello = [0_u8; 16 * 1024];
+            let _ = stream.read(&mut client_hello).unwrap();
+            stream.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).unwrap();
+            stream.flush().unwrap();
+            for _ in 0..24 {
+                if stream.write_all(&[0]).is_err() || stream.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let policy = DownloadPolicy {
+            connect_timeout: Duration::from_millis(250),
+            idle_read_timeout: Duration::from_secs(1),
+            http_timeout: Duration::from_secs(2),
+            max_compressed: 1024,
+            max_uncompressed: 4096,
+        };
+        let proxy = ureq::Proxy::new(&format!("https://{address}")).unwrap();
+        let config = ureq::Agent::config_builder()
+            .proxy(Some(proxy))
+            .max_redirects(5)
+            .max_redirects_will_error(true)
+            .max_response_header_size(64 * 1024)
+            .accept_encoding("identity")
+            .timeout_global(Some(policy.http_timeout))
+            .timeout_resolve(Some(policy.connect_timeout))
+            .timeout_connect(Some(policy.connect_timeout))
+            .timeout_recv_body(Some(policy.idle_read_timeout))
+            .build();
+        let started = Instant::now();
+        let deadline = started + policy.http_timeout;
+        let agent = build_agent(config, policy, deadline);
+
+        let error = anyhow::Error::new(
+            agent
+                .get("http://example.invalid/data.gz")
+                .call()
+                .unwrap_err(),
+        );
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(elapsed < Duration::from_millis(700), "elapsed: {elapsed:?}");
+        assert!(
+            contains_ureq_timeout(&error, ureq::Timeout::Connect),
+            "got: {error:#}"
+        );
     }
 
     #[test]
