@@ -73,11 +73,38 @@ fn no_match_is_empty_not_error() {
 }
 
 #[test]
-fn short_query_uses_like_fallback() {
+fn short_query_uses_substring_fallback() {
     let conn = fixture();
     let g = search(&conn, "色即", None, 3).unwrap(); // 2 chars < 3
     assert_eq!(g.len(), 1);
     assert_eq!(g[0].zh_text, "色即是空");
+}
+
+#[test]
+fn short_query_treats_percent_and_underscore_literally() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    for (zt, zn) in [
+        ("literal-percent", "經%甲文"),
+        ("percent-decoy", "經別甲文"),
+        ("literal-underscore", "經_乙文"),
+        ("underscore-decoy", "經別乙文"),
+    ] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?2,'sa',?1,1.0,'T0001','測試',1)",
+            params![zt, zn],
+        )
+        .unwrap();
+    }
+
+    let percent = search(&conn, "%甲", None, 3).unwrap();
+    assert_eq!(percent.len(), 1);
+    assert_eq!(percent[0].zh_text, "literal-percent");
+
+    let underscore = search(&conn, "_乙", None, 3).unwrap();
+    assert_eq!(underscore.len(), 1);
+    assert_eq!(underscore[0].zh_text, "literal-underscore");
 }
 
 #[test]
@@ -101,6 +128,79 @@ fn per_lang_cap_and_order() {
         sa[1].text, "sa-mid",
         "second highest; lowest (sa-lo) dropped"
     );
+}
+
+#[test]
+fn duplicate_parallel_keeps_highest_confidence_before_cap() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    for (text, confidence) in [
+        ("duplicate", 0.95_f64),
+        ("duplicate", 0.90),
+        ("runner-up", 0.80),
+    ] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES ('色即是空','色即是空','sa',?1,?2,'T0251','心經',1)",
+            params![text, confidence],
+        )
+        .unwrap();
+    }
+
+    let groups = search(&conn, "色即是空", None, 2).unwrap();
+    let parallels = &groups[0].parallels;
+    assert_eq!(parallels.len(), 2);
+    assert_eq!(parallels[0].text, "duplicate");
+    assert_eq!(parallels[0].confidence, Some(0.95));
+    assert_eq!(parallels[1].text, "runner-up");
+}
+
+#[test]
+fn duplicate_text_is_preserved_across_groups_and_languages() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    for (zt, lang, confidence, cbeta_id) in [
+        ("甲色即是空", "sa", 0.90_f64, "T0001"),
+        ("甲色即是空", "bo", 0.80, "T0001"),
+        ("乙色即是空", "sa", 0.70, "T0002"),
+    ] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,'色即是空',?2,'shared text',?3,?4,'測試',1)",
+            params![zt, lang, confidence, cbeta_id],
+        )
+        .unwrap();
+    }
+
+    let groups = search(&conn, "色即是空", None, 3).unwrap();
+    assert_eq!(groups.len(), 2, "the same text remains in both groups");
+    assert_eq!(groups[0].parallels.len(), 2);
+    assert_eq!(groups[0].parallels[0].lang, "bo");
+    assert_eq!(groups[0].parallels[1].lang, "sa");
+    assert_eq!(groups[1].parallels.len(), 1);
+    assert_eq!(groups[1].parallels[0].text, "shared text");
+}
+
+#[test]
+fn equal_confidence_parallels_use_text_tie_breaker() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    for text in ["zeta", "alpha"] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES ('色即是空','色即是空','sa',?1,0.9,'T0251','心經',1)",
+            [text],
+        )
+        .unwrap();
+    }
+
+    let groups = search(&conn, "色即是空", None, 3).unwrap();
+    let texts: Vec<_> = groups[0]
+        .parallels
+        .iter()
+        .map(|parallel| parallel.text.as_str())
+        .collect();
+    assert_eq!(texts, ["alpha", "zeta"]);
 }
 
 #[test]

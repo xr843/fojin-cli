@@ -24,6 +24,8 @@ $ fojin parallel "色即是空"
 
 ## 安装
 
+从 crates.io 或源码构建要求 **Rust 1.95 或更新版本**（MSRV 1.95）；使用预编译二进制不需要安装 Rust。
+
 通过 [crates.io](https://crates.io/crates/fojin-cli) 安装(命令为 `fojin`）：
 
 ```bash
@@ -36,11 +38,30 @@ cargo install fojin-cli --locked
 curl -fsSL https://raw.githubusercontent.com/xr843/fojin-cli/master/install.sh | sh
 ```
 
+这项校验合同从 **v0.3.0** 起适用：安装脚本要求它解析出的最新版本或 `FOJIN_VERSION` 指定的目标
+**二进制 release** 同时提供 `SHA256SUMS`，并在解压和安装前用 `sha256sum` 或 `shasum -a 256`
+核对 archive；缺少校验工具、校验记录不唯一或摘要不匹配时都会停止安装。
+
+如果目标二进制 release 早于 v0.3.0（包括 v0.3.0 尚未发布的过渡窗口中，脚本自动解析到旧版），
+旧 release 没有 `SHA256SUMS` 时脚本会在解压前安全失败。此时请改用 crates.io 当前已发布版本，
+或从源码构建；这段说明不表示 v0.3.0 已经发布。
+
 也可从 [Releases](https://github.com/xr843/fojin-cli/releases/latest) 手动下载各平台二进制(含 Windows x64 zip),或从源码安装：
 
 ```bash
 cargo install --git https://github.com/xr843/fojin-cli --locked
 ```
+
+手动下载时请一并下载同一 release 的 `SHA256SUMS`，并在解压前核对所下载 archive 的 SHA-256。
+例如 GNU `sha256sum` 可从清单中筛选对应文件后校验（将占位符替换为 release 中的实际名称）：
+
+```bash
+archive="fojin-<VERSION>-<TARGET>.tar.gz"
+grep "  ${archive}$" SHA256SUMS | sha256sum -c -
+```
+
+macOS 可将最后一段换为 `shasum -a 256 -c -`；Windows 可用 `Get-FileHash -Algorithm SHA256`
+并与 `SHA256SUMS` 中对应的唯一记录比较。
 
 首次运行 `fojin parallel` 会自动下载对齐数据集(约 183 MB,带进度显示,见下方「数据集」),之后完全离线。
 
@@ -161,8 +182,9 @@ fojin parallel "<汉文短语>" --json --offline
   - 藏 / Tibetan:676,898 条
   - 梵 / Sanskrit:231,722 条
 - 来源:Dharmamitra 的 [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) 对齐数据集([Nehrdich & Keutzer, 2026](https://arxiv.org/pdf/2601.06400)),以 GitHub Release(`data-v1`)形式分发;学术使用请引用原论文(BibTeX 见 [`DATA_LICENSE`](DATA_LICENSE))。
+- 当前二进制把官方下载地址、SHA-256 与兼容元数据固定在 `data-v1`;`fojin data update` 只会重新获取这份固定数据,不会自动切换到未来的数据主版本。版本、归一化规则或查询所需 schema 不兼容的数据会被拒绝。
 - 首次运行时下载,压缩包约 **183 MB**,解压后约 **561 MB**(SQLite)。下载后完全离线可用。
-- 当前不含巴利对齐(上游 MITRA-parallel 尚未覆盖巴利),默认输出不显示巴利行;显式 `--lang pi` 仍可查询(如实答「未找到对齐」)。上游补充后将随新数据版本自动显示,无需升级程序。
+- 当前不含巴利对齐(上游 MITRA-parallel 尚未覆盖巴利),默认输出不显示巴利行;显式 `--lang pi` 仍可查询(如实答「未找到对齐」)。程序的渲染路径可兼容未来新增语言行,但当前官方下载通道仍固定为 `data-v1`;上游出现新语言不代表当前二进制会自动获得它。**渲染兼容不等于官方更新通道无需升级**,未来数据版本可能要求升级二进制或明确切换数据发布。
 - 许可:**CC BY-SA 4.0**(Dharmamitra + fojin)。
 - 范围:仅含 MITRA 跨藏平行;fojin 自有的精选对齐(alignment_pairs)**未包含**在本数据集中。
 - 未来可能提供体积更小的 lite 子集,供带宽/存储受限场景使用(尚未实现)。
@@ -194,8 +216,9 @@ fojin data verify                 # verify version, SQLite, and FTS integrity
 ```
 
 - **Input**: Chinese only (traditional/simplified folded, punctuation ignored); literal substring matching over normalized text. 2-to-12-character phrases work best.
+- **Build/install integrity**: building from crates.io or source requires Rust 1.95+ (MSRV 1.95). Starting with v0.3.0, the shell installer requires the target binary release to provide `SHA256SUMS` and verifies the archive before extraction. It fails closed for an older latest or explicitly selected release without that file, including the transition before v0.3.0 is published; use the currently published crates.io version or a source build instead. This does not state that v0.3.0 has been released.
 - **For AI agents**: pure-JSON stdout, semantic exit codes (`0` ok / `1` runtime / `2` usage), zero network with `--offline`. Ready-made Claude Code integration in [`examples/claude/`](examples/claude/).
-- **Data**: 908,620 zh↔sa/bo alignments from Dharmamitra's [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) dataset, redistributed under CC BY-SA 4.0. Academic use: please cite [Nehrdich & Keutzer (2026)](https://arxiv.org/pdf/2601.06400) — BibTeX in [`DATA_LICENSE`](DATA_LICENSE).
+- **Data**: 908,620 zh↔sa/bo alignments from Dharmamitra's [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) dataset, redistributed under CC BY-SA 4.0. The official URL, checksum, and compatibility contract remain pinned to `data-v1`; rendering support for future language rows does not mean the official update channel can adopt them without a binary upgrade. Academic use: please cite [Nehrdich & Keutzer (2026)](https://arxiv.org/pdf/2601.06400) — BibTeX in [`DATA_LICENSE`](DATA_LICENSE).
 - **Not in scope**: semantic search, Pāli, translation — use [Dharmamitra](https://dharmamitra.org)'s online APIs for those; the two are complementary.
 - **License**: code MIT OR Apache-2.0; data CC BY-SA 4.0.
 

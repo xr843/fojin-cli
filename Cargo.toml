@@ -1,8 +1,8 @@
 [package]
 name = "fojin-cli"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.95"
 description = "fojin 跨藏对读 CLI —— 离线查询佛典汉文的梵/巴/藏平行 (offline, no login)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xr843/fojin-cli"
@@ -21,7 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "=4.5.53", features = ["derive"] }
-rusqlite = { version = "=0.32.1", features = ["bundled"] }
+rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "5"

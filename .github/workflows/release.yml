@@ -1,24 +1,63 @@
-# Builds cross-platform `fojin` binaries and attaches them to the GitHub
-# Release created for a pushed `vN.N.N` tag (binary release, e.g. v0.1.0).
-#
-# NOTE: this ships the CLI binary only. On first run the binary downloads
-# the data artifact (the parallels SQLite DB), which is published
-# separately under its own `data-vN` tag (see src/cli.rs). Cutting a
-# binary release does NOT publish or update the data artifact.
+# Builds cross-platform `fojin` archives for a stable vX.Y.Z tag. A manual
+# dispatch exercises the complete build and verification path without publishing.
 name: release
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - name: Determine and validate release version
+        id: version
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          version="$(python3 -c 'import json, sys; data=json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "fojin-cli"))' <<<"$metadata")"
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            scripts/check-release-version.sh "$REF_NAME" "$version"
+          fi
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+      - name: Upload release verifiers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verification-tools
+          path: |
+            scripts/check-release-archive.sh
+            scripts/check-release-availability.sh
+          if-no-files-found: error
+          retention-days: 1
+
   build:
     name: build (${{ matrix.target }})
+    needs: prepare
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -29,49 +68,165 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             archive_ext: tar.gz
-          # Cross-compiled from the arm64 runner: dedicated Intel (macos-13)
-          # runners are scarce and can sit queued for an hour+.
           - target: x86_64-apple-darwin
             os: macos-latest
             archive_ext: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive_ext: zip
-
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package archive (unix)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Package archive (Unix)
         if: matrix.archive_ext == 'tar.gz'
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          staging="fojin-${version}-${{ matrix.target }}"
-          mkdir -p "$staging"
-          cp "target/${{ matrix.target }}/release/fojin" "$staging/"
-          tar -czf "${staging}.tar.gz" "$staging"
-          echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
-
-      - name: Package archive (windows)
+          staging="fojin-${VERSION}-${TARGET}"
+          mkdir "$staging"
+          cp "target/${TARGET}/release/fojin" "$staging/fojin"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$staging/"
+          chmod 755 "$staging/fojin"
+          COPYFILE_DISABLE=1 tar -czf "${staging}.tar.gz" "$staging"
+          printf 'ASSET=%s\n' "${staging}.tar.gz" >>"$GITHUB_ENV"
+      - name: Package archive (Windows)
         if: matrix.archive_ext == 'zip'
         shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart("v")
-          $staging = "fojin-$version-${{ matrix.target }}"
+          $ErrorActionPreference = 'Stop'
+          $staging = "fojin-$env:VERSION-$env:TARGET"
+          $archive = "$staging.zip"
           New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/fojin.exe" "$staging/"
-          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
-          Add-Content -Path $env:GITHUB_ENV -Value "ASSET=$staging.zip"
-
-      - name: Upload release asset
-        uses: softprops/action-gh-release@v2
+          Copy-Item -LiteralPath "target/$env:TARGET/release/fojin.exe" -Destination "$staging/fojin.exe"
+          Copy-Item -LiteralPath "README.md" -Destination "$staging/README.md"
+          Copy-Item -LiteralPath "LICENSE-MIT" -Destination "$staging/LICENSE-MIT"
+          Copy-Item -LiteralPath "LICENSE-APACHE" -Destination "$staging/LICENSE-APACHE"
+          Compress-Archive -LiteralPath $staging -DestinationPath $archive
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "ASSET=$archive"
+      - name: Upload target archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          files: ${{ env.ASSET }}
+          name: release-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          compression-level: 0
+
+  aggregate:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Download archive verifier
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verification-tools
+          path: verification-tools
+      - name: Download target archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Validate archive set and contents
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          targets=(
+            x86_64-unknown-linux-gnu
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            x86_64-pc-windows-msvc
+          )
+          archives=(
+            "fojin-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "fojin-${VERSION}-aarch64-apple-darwin.tar.gz"
+            "fojin-${VERSION}-x86_64-apple-darwin.tar.gz"
+            "fojin-${VERSION}-x86_64-pc-windows-msvc.zip"
+          )
+          mapfile -t actual < <(find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+          mapfile -t expected < <(printf '%s\n' "${archives[@]}" | LC_ALL=C sort)
+          if [[ "${#actual[@]}" -ne 4 ]] || ! diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${actual[@]}"); then
+            printf 'expected exactly four target archives\n' >&2
+            exit 1
+          fi
+          chmod +x verification-tools/check-release-archive.sh
+          for index in "${!archives[@]}"; do
+            verification-tools/check-release-archive.sh "dist/${archives[$index]}" "${targets[$index]}" "$VERSION"
+          done
+          (
+            cd dist
+            sha256sum "${archives[@]}" >SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: |
+            dist/fojin-${{ needs.prepare.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            dist/fojin-${{ needs.prepare.outputs.version }}-aarch64-apple-darwin.tar.gz
+            dist/fojin-${{ needs.prepare.outputs.version }}-x86_64-apple-darwin.tar.gz
+            dist/fojin-${{ needs.prepare.outputs.version }}-x86_64-pc-windows-msvc.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [prepare, aggregate]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+      - name: Download release verifiers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verification-tools
+          path: verification-tools
+      - name: Recheck release checksums
+        shell: bash
+        run: cd dist && sha256sum -c SHA256SUMS
+      - name: Make release availability verifier executable
+        shell: bash
+        run: chmod +x verification-tools/check-release-availability.sh
+      - name: Reject an existing release for this tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: verification-tools/check-release-availability.sh "$REPOSITORY" "$REF_NAME"
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          files: |
+            dist/fojin-${{ needs.prepare.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            dist/fojin-${{ needs.prepare.outputs.version }}-aarch64-apple-darwin.tar.gz
+            dist/fojin-${{ needs.prepare.outputs.version }}-x86_64-apple-darwin.tar.gz
+            dist/fojin-${{ needs.prepare.outputs.version }}-x86_64-pc-windows-msvc.zip
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          overwrite_files: false

@@ -44,8 +44,8 @@ fn fetch_rows(conn: &Connection, norm_query: &str) -> rusqlite::Result<Vec<Row>>
         (
             "SELECT zh_text,zh_norm,foreign_lang,foreign_text,confidence,\
                     cbeta_id,title_zh,juan_num \
-             FROM parallels WHERE zh_norm LIKE ?1",
-            format!("%{norm_query}%"),
+             FROM parallels WHERE instr(zh_norm, ?1) > 0",
+            norm_query.to_owned(),
         )
     };
     let mut stmt = conn.prepare(sql)?;
@@ -262,13 +262,17 @@ pub fn texts_matching(
          WHERE cbeta_id IS NOT NULL AND title_zh IS NOT NULL \
          GROUP BY cbeta_id, title_zh, foreign_lang ORDER BY cbeta_id, foreign_lang",
     )?;
+    let count = |row: &rusqlite::Row<'_>, index: usize| -> rusqlite::Result<u64> {
+        let value = row.get::<_, i64>(index)?;
+        u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+    };
     let rows = stmt
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, u64>(3)?,
+                count(r, 3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -295,15 +299,26 @@ pub fn texts_matching(
 fn cap_per_lang(parallels: Vec<Parallel>, top: usize) -> Vec<Parallel> {
     let mut by_lang: BTreeMap<String, Vec<Parallel>> = BTreeMap::new();
     for p in parallels {
-        by_lang.entry(p.lang.clone()).or_default().push(p);
+        let items = by_lang.entry(p.lang.clone()).or_default();
+        if let Some(existing) = items.iter_mut().find(|existing| existing.text == p.text) {
+            if p.confidence
+                .unwrap_or(0.0)
+                .total_cmp(&existing.confidence.unwrap_or(0.0))
+                == Ordering::Greater
+            {
+                *existing = p;
+            }
+        } else {
+            items.push(p);
+        }
     }
     let mut out = Vec::new();
     for (_lang, mut items) in by_lang {
         items.sort_by(|a, b| {
             b.confidence
                 .unwrap_or(0.0)
-                .partial_cmp(&a.confidence.unwrap_or(0.0))
-                .unwrap_or(Ordering::Equal)
+                .total_cmp(&a.confidence.unwrap_or(0.0))
+                .then_with(|| a.text.cmp(&b.text))
         });
         items.truncate(top.max(1)); // floor of 1: top=0 would yield a useless 0-parallel result
         out.extend(items);

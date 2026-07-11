@@ -1,6 +1,15 @@
 use rusqlite::Connection;
 
 #[test]
+fn bundled_sqlite_is_at_least_3_53_2() {
+    assert!(
+        rusqlite::version_number() >= 3_053_002,
+        "runtime SQLite {} must be at least 3.53.2",
+        rusqlite::version()
+    );
+}
+
+#[test]
 fn schema_creates_tables_and_fts_autopopulates() {
     let conn = Connection::open_in_memory().unwrap();
     fojin_cli::schema::init_schema(&conn).unwrap();
