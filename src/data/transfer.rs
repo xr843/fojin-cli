@@ -6,11 +6,89 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const MIB: u64 = 1024 * 1024;
 const BUFFER_SIZE: usize = 64 * 1024;
 static ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+// Ureq's socket adapter turns an already-expired zero timeout into one second
+// because operating systems reject a zero socket timeout. Reject it before the
+// adapter instead, including when protocol bytes are already buffered, so the
+// configured global deadline remains a hard boundary under byte dribbling.
+// The transport API is unversioned, so ureq is pinned exactly in Cargo.toml.
+#[derive(Debug)]
+struct StrictTimeoutConnector;
+
+#[derive(Debug)]
+struct StrictTimeoutTransport<T> {
+    inner: T,
+}
+
+impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Connector<T>
+    for StrictTimeoutConnector
+{
+    type Out = StrictTimeoutTransport<T>;
+
+    fn connect(
+        &self,
+        _: &ureq::unversioned::transport::ConnectionDetails<'_>,
+        chained: Option<T>,
+    ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|inner| StrictTimeoutTransport { inner }))
+    }
+}
+
+impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Transport
+    for StrictTimeoutTransport<T>
+{
+    fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> std::result::Result<(), ureq::Error> {
+        require_remaining_timeout(timeout)?;
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn maybe_await_input(
+        &mut self,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> std::result::Result<bool, ureq::Error> {
+        require_remaining_timeout(timeout)?;
+        self.inner.maybe_await_input(timeout)
+    }
+
+    fn await_input(
+        &mut self,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> std::result::Result<bool, ureq::Error> {
+        require_remaining_timeout(timeout)?;
+        self.inner.await_input(timeout)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+}
+
+fn require_remaining_timeout(
+    timeout: ureq::unversioned::transport::NextTimeout,
+) -> std::result::Result<(), ureq::Error> {
+    if !timeout.after.is_not_happening() && timeout.after.is_zero() {
+        Err(ureq::Error::Timeout(timeout.reason))
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DownloadPolicy {
@@ -138,12 +216,92 @@ fn create_compressed_artifact(live_path: &Path) -> Result<(OwnedCompressed, File
 fn create_candidate_artifact(live_path: &Path) -> Result<(StagedCandidate, File)> {
     loop {
         let path = unique_path(live_path, "candidate", "")?;
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => return Ok((StagedCandidate { path, armed: true }, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error).with_context(|| format!("创建候选数据失败: {}", path.display()));
-            }
+        if let Some(candidate) = try_create_candidate_artifact(&path)? {
+            return Ok(candidate);
+        }
+    }
+}
+
+fn try_create_candidate_artifact(path: &Path) -> Result<Option<(StagedCandidate, File)>> {
+    try_create_candidate_artifact_with(path, path_entry_exists)
+}
+
+fn try_create_candidate_artifact_with<F>(
+    path: &Path,
+    mut entry_exists: F,
+) -> Result<Option<(StagedCandidate, File)>>
+where
+    F: FnMut(&Path) -> Result<bool>,
+{
+    let sidecars = ["-journal", "-shm", "-wal"]
+        .map(|suffix| sibling_path(path, suffix))
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let family_occupied = sidecars
+        .iter()
+        .try_fold(entry_exists(path)?, |occupied, sidecar| {
+            entry_exists(sidecar).map(|exists| occupied || exists)
+        })?;
+    if family_occupied {
+        return Ok(None);
+    }
+
+    let file = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("创建候选数据失败: {}", path.display()));
+        }
+    };
+
+    // The main file reserves this generation. Recheck the sidecars after that
+    // reservation so a stale family can never be claimed and later deleted by
+    // this guard. Under the data-operation lock, any sidecar that appears after
+    // this point can only be produced by SQLite while operating on this unique
+    // candidate.
+    let sidecar_occupied = sidecars.iter().try_fold(false, |occupied, sidecar| {
+        entry_exists(sidecar).map(|exists| occupied || exists)
+    });
+    let sidecar_occupied = match sidecar_occupied {
+        Ok(occupied) => occupied,
+        Err(error) => {
+            drop(file);
+            return Err(cleanup_owned_candidate_main(path, error));
+        }
+    };
+    if sidecar_occupied {
+        drop(file);
+        std::fs::remove_file(path)
+            .with_context(|| format!("释放冲突候选数据失败: {}", path.display()))?;
+        return Ok(None);
+    }
+
+    Ok(Some((
+        StagedCandidate {
+            path: path.to_path_buf(),
+            armed: true,
+        },
+        file,
+    )))
+}
+
+fn cleanup_owned_candidate_main(path: &Path, error: anyhow::Error) -> anyhow::Error {
+    match std::fs::remove_file(path) {
+        Ok(()) => error,
+        Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => error,
+        Err(cleanup) => error.context(format!(
+            "清理候选数据主文件失败: {}: {cleanup}",
+            path.display()
+        )),
+    }
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("检查临时数据路径失败: {}", path.display()))
         }
     }
 }
@@ -183,16 +341,17 @@ pub(super) fn remove_known_artifacts(live_path: &Path) -> Result<()> {
     let file_name = live_path
         .file_name()
         .ok_or_else(|| anyhow!("数据路径没有文件名: {}", live_path.display()))?
-        .to_string_lossy();
-    let download_prefix = format!("{file_name}.download.");
-    let candidate_prefix = format!("{file_name}.candidate.");
+        .to_str()
+        .ok_or_else(|| anyhow!("数据文件名不是有效 UTF-8: {}", live_path.display()))?;
     for entry in std::fs::read_dir(directory)
         .with_context(|| format!("读取数据目录失败: {}", directory.display()))?
     {
         let entry = entry.context("读取数据目录项失败")?;
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with(&download_prefix) && !name.starts_with(&candidate_prefix) {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_owned_artifact_name(file_name, name) {
             continue;
         }
         if entry.file_type().context("读取临时数据类型失败")?.is_dir() {
@@ -202,6 +361,40 @@ pub(super) fn remove_known_artifacts(live_path: &Path) -> Result<()> {
             .with_context(|| format!("删除临时数据失败: {}", entry.path().display()))?;
     }
     Ok(())
+}
+
+fn is_owned_artifact_name(live_name: &str, artifact_name: &str) -> bool {
+    let Some(suffix) = artifact_name.strip_prefix(live_name) else {
+        return false;
+    };
+
+    if let Some(generation) = suffix
+        .strip_prefix(".download.")
+        .and_then(|name| name.strip_suffix(".gz"))
+    {
+        return is_numeric_generation(generation);
+    }
+
+    let Some(candidate) = suffix.strip_prefix(".candidate.") else {
+        return false;
+    };
+    let generation = ["-journal", "-shm", "-wal"]
+        .into_iter()
+        .find_map(|sidecar| candidate.strip_suffix(sidecar))
+        .unwrap_or(candidate);
+    is_numeric_generation(generation)
+}
+
+fn is_numeric_generation(value: &str) -> bool {
+    let mut parts = value.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(pid), Some(sequence), None)
+            if !pid.is_empty()
+                && !sequence.is_empty()
+                && pid.bytes().all(|byte| byte.is_ascii_digit())
+                && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    )
 }
 
 fn copy_bounded(
@@ -245,39 +438,51 @@ fn stage_candidate_inner(
     policy: DownloadPolicy,
     compressed_file: &mut File,
 ) -> Result<StagedCandidate> {
-    let deadline = Instant::now()
-        .checked_add(policy.http_timeout)
-        .ok_or_else(|| anyhow!("HTTP 总超时配置溢出"))?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(policy.connect_timeout)
-        .timeout_read(policy.idle_read_timeout)
+    let config = ureq::Agent::config_builder()
+        .max_redirects(5)
+        .max_redirects_will_error(true)
+        .max_response_header_size(64 * 1024)
+        .accept_encoding("identity")
+        .timeout_global(Some(policy.http_timeout))
+        .timeout_resolve(Some(policy.connect_timeout))
+        .timeout_connect(Some(policy.connect_timeout))
+        .timeout_recv_response(Some(policy.idle_read_timeout))
+        .timeout_recv_body(Some(policy.idle_read_timeout))
         .build();
-    let response = agent
+    use ureq::unversioned::transport::Connector;
+    let connector =
+        ureq::unversioned::transport::DefaultConnector::new().chain(StrictTimeoutConnector);
+    let agent = ureq::Agent::with_parts(
+        config,
+        connector,
+        ureq::unversioned::resolver::DefaultResolver::default(),
+    );
+    let mut response = agent
         .get(source.url)
-        .set("Accept-Encoding", "identity")
-        .call();
-    require_http_deadline(deadline)?;
-    let response = response.map_err(|error| {
-        let context = format!(
-            "下载失败: {}: {error}\n请手动下载:\n  {}\n解压后放到: {}",
-            source.url,
-            source.url,
-            live_path.display()
-        );
-        anyhow::Error::new(error).context(context)
-    })?;
+        .header("Accept-Encoding", "identity")
+        .call()
+        .map_err(normalize_ureq_error)
+        .map_err(|error| download_error_context(error, "下载失败", live_path, source.url))?;
     let declared = declared_length(&response, policy.max_compressed)?;
     eprintln!("{}", download_notice(declared));
 
-    let mut reader = response.into_reader();
+    let mut reader = response
+        .body_mut()
+        .with_config()
+        .limit(policy.max_compressed.saturating_add(1))
+        .reader();
     let mut progress = Progress::new(declared);
     let mut digest = Sha256::new();
     let mut received = 0_u64;
     let mut buffer = [0_u8; BUFFER_SIZE];
     loop {
-        require_http_deadline(deadline)?;
-        let count = reader.read(&mut buffer).context("读取响应失败")?;
-        require_http_deadline(deadline)?;
+        let count = reader
+            .read(&mut buffer)
+            .map_err(normalize_body_read_error)
+            .map_err(anyhow::Error::new)
+            .map_err(|error| {
+                download_error_context(error, "读取响应失败", live_path, source.url)
+            })?;
         if count == 0 {
             break;
         }
@@ -298,7 +503,8 @@ fn stage_candidate_inner(
             eprintln!("{message}");
         }
     }
-    require_declared_length(declared, received)?;
+    require_declared_length(declared, received)
+        .map_err(|error| download_error_context(error, "读取响应失败", live_path, source.url))?;
     let actual = digest.finalize();
     require_digest(actual.as_ref(), source.sha256).map_err(|error| {
         anyhow!(
@@ -328,25 +534,61 @@ fn stage_candidate_inner(
     }
 }
 
-fn require_http_deadline(deadline: Instant) -> Result<()> {
-    if Instant::now() >= deadline {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "HTTP total deadline timed out",
-        ))
-        .context("读取响应失败");
-    }
-    Ok(())
+fn download_error_context(
+    error: anyhow::Error,
+    action: &str,
+    live_path: &Path,
+    url: &str,
+) -> anyhow::Error {
+    let cause = error.to_string();
+    error.context(format!(
+        "{action}: {url}: {cause}\n请手动下载:\n  {url}\n解压后放到: {}",
+        live_path.display()
+    ))
 }
 
-fn declared_length(response: &ureq::Response, maximum: u64) -> Result<Option<u64>> {
-    if !response.all("Transfer-Encoding").is_empty() {
+fn normalize_ureq_error(error: ureq::Error) -> anyhow::Error {
+    if matches!(error, ureq::Error::Timeout(_)) {
+        anyhow::Error::new(io::Error::new(io::ErrorKind::TimedOut, error))
+    } else {
+        anyhow::Error::new(error)
+    }
+}
+
+fn normalize_body_read_error(error: io::Error) -> io::Error {
+    let is_timeout = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<ureq::Error>())
+        .is_some_and(|source| matches!(source, ureq::Error::Timeout(_)));
+    if is_timeout {
+        io::Error::new(io::ErrorKind::TimedOut, error)
+    } else {
+        error
+    }
+}
+
+fn declared_length(
+    response: &ureq::http::Response<ureq::Body>,
+    maximum: u64,
+) -> Result<Option<u64>> {
+    if response
+        .headers()
+        .get_all(ureq::http::header::TRANSFER_ENCODING)
+        .iter()
+        .next()
+        .is_some()
+    {
         return Ok(None);
     }
-    let values = response.all("Content-Length");
+    let values: Vec<_> = response
+        .headers()
+        .get_all(ureq::http::header::CONTENT_LENGTH)
+        .iter()
+        .collect();
     match values.as_slice() {
         [] => Ok(None),
         [value] => {
+            let value = value.to_str().context("Content-Length 不是有效 ASCII")?;
             let parsed = value
                 .parse::<u64>()
                 .with_context(|| format!("无效 Content-Length: {value}"))?;
@@ -387,6 +629,7 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::{Cursor, Read, Write};
+    use std::time::Instant;
 
     fn policy_for_tests() -> DownloadPolicy {
         DownloadPolicy {
@@ -396,6 +639,45 @@ mod tests {
             max_compressed: 1024,
             max_uncompressed: 4096,
         }
+    }
+
+    #[test]
+    fn candidate_reservation_rejects_a_preexisting_sidecar_family() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = directory.path().join("data.sqlite.candidate.123.4");
+        let wal = sibling_path(&candidate, "-wal").unwrap();
+        std::fs::write(&wal, b"foreign wal").unwrap();
+
+        assert!(try_create_candidate_artifact(&candidate).unwrap().is_none());
+        assert!(!candidate.exists());
+        assert_eq!(std::fs::read(wal).unwrap(), b"foreign wal");
+    }
+
+    #[test]
+    fn candidate_reservation_cleans_its_main_file_when_postcheck_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = directory.path().join("data.sqlite.candidate.123.4");
+        let checks = std::cell::Cell::new(0_usize);
+
+        let result = try_create_candidate_artifact_with(&candidate, |_| {
+            let next = checks.get() + 1;
+            checks.set(next);
+            if next == 5 {
+                Err(anyhow!("injected sidecar inspection failure"))
+            } else {
+                Ok(false)
+            }
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("post-reservation inspection failure was ignored"),
+        };
+
+        assert!(
+            format!("{error:#}").contains("injected sidecar inspection failure"),
+            "got: {error:#}"
+        );
+        assert!(!candidate.exists(), "owned candidate main leaked");
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
@@ -580,6 +862,49 @@ mod tests {
         result
     }
 
+    fn stage_from_protocol_dribble(
+        prefix: &'static [u8],
+        dribble: u8,
+        count: usize,
+        suffix: &'static [u8],
+        interval: Duration,
+        policy: DownloadPolicy,
+    ) -> (Result<()>, Duration) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            if stream.write_all(prefix).is_err() {
+                return;
+            }
+            for _ in 0..count {
+                if stream.write_all(&[dribble]).is_err() || stream.flush().is_err() {
+                    return;
+                }
+                std::thread::sleep(interval);
+            }
+            let _ = stream.write_all(suffix);
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let url = format!("http://{address}/data.gz");
+        let sha = "0".repeat(64);
+        let started = Instant::now();
+        let result = stage_candidate(
+            &live,
+            &DataSource {
+                url: &url,
+                sha256: &sha,
+            },
+            policy,
+        )
+        .map(drop);
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        (result, elapsed)
+    }
+
     fn contains_io_kind(error: &anyhow::Error, expected: io::ErrorKind) -> bool {
         error.chain().any(|cause| {
             cause
@@ -639,6 +964,10 @@ mod tests {
             contains_io_kind(&error, io::ErrorKind::UnexpectedEof),
             "got: {error:#}"
         );
+        assert!(
+            format!("{error:#}").contains("请手动下载"),
+            "got: {error:#}"
+        );
     }
 
     #[test]
@@ -662,6 +991,64 @@ mod tests {
     }
 
     #[test]
+    fn global_timeout_interrupts_continuously_dribbling_response_headers() {
+        let policy = DownloadPolicy {
+            connect_timeout: Duration::from_millis(200),
+            idle_read_timeout: Duration::from_millis(200),
+            http_timeout: Duration::from_millis(250),
+            max_compressed: 1024,
+            max_uncompressed: 4096,
+        };
+        let (result, elapsed) = stage_from_protocol_dribble(
+            b"HTTP/1.1 200 OK\r\nX-Slow: ",
+            b'a',
+            40,
+            b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            Duration::from_millis(50),
+            policy,
+        );
+        let error = result.unwrap_err();
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        assert!(
+            contains_io_kind(&error, io::ErrorKind::TimedOut),
+            "got: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("请手动下载"),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn global_timeout_interrupts_continuously_dribbling_chunk_framing() {
+        let policy = DownloadPolicy {
+            connect_timeout: Duration::from_millis(200),
+            idle_read_timeout: Duration::from_millis(200),
+            http_timeout: Duration::from_millis(250),
+            max_compressed: 1024,
+            max_uncompressed: 4096,
+        };
+        let (result, elapsed) = stage_from_protocol_dribble(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1;",
+            b'a',
+            40,
+            b"\r\nx\r\n0\r\n\r\n",
+            Duration::from_millis(50),
+            policy,
+        );
+        let error = result.unwrap_err();
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        assert!(
+            contains_io_kind(&error, io::ErrorKind::TimedOut),
+            "got: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("请手动下载"),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
     fn oversized_declared_length_is_rejected_before_body_reads() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 1025\r\nConnection: close\r\n\r\n";
         let error = stage_from_raw_response(response, policy_for_tests())
@@ -680,8 +1067,10 @@ mod tests {
         let error = stage_from_raw_response(response, policy_for_tests())
             .unwrap_err()
             .to_string();
+        let lower = error.to_ascii_lowercase();
         assert!(
-            error.contains("无效 Content-Length") && error.contains("nope"),
+            lower.contains("content-length")
+                && (error.contains("无效") || lower.contains("not a number")),
             "got: {error}"
         );
         assert!(!error.contains("读取响应失败"), "got: {error}");
@@ -733,6 +1122,10 @@ mod tests {
             contains_io_kind(&error, io::ErrorKind::TimedOut),
             "got: {error:#}"
         );
+        let detail = format!("{error:#}");
+        assert!(detail.contains("http://"), "got: {detail}");
+        assert!(detail.contains("data.sqlite"), "got: {detail}");
+        assert!(detail.contains("请手动下载"), "got: {detail}");
     }
 
     #[test]
