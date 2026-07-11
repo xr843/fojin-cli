@@ -1,18 +1,14 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{OpenFlags, OptionalExtension};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
-/// Connect timeout for the data download: fails fast if the release host is
-/// unreachable rather than hanging forever.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Overall read ceiling for the data download. The artifact is ~100-200MB,
-/// so this is generous for a slow-but-alive connection while still
-/// guaranteeing the CLI can never hang indefinitely.
-const READ_TIMEOUT: Duration = Duration::from_secs(900);
-static CANDIDATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+mod operation_lock;
+mod transfer;
+
+#[cfg(windows)]
+static REPLACEMENT_BACKUP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 pub const EXPECTED_DATA_VERSION: &str = "v1";
 pub const EXPECTED_NORM_RULESET: &str = "t2s-char-1to1-v1";
@@ -117,8 +113,11 @@ pub fn ensure_data(path: &Path, offline: bool, source: &DataSource) -> Result<()
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("创建缓存目录失败")?;
     }
-    let raw = download_and_unpack(path, source)?;
-    write_atomic(path, &raw)
+    let _lock = operation_lock::acquire(path, operation_lock::LOCK_WAIT_TIMEOUT)?;
+    if path.exists() {
+        return Ok(());
+    }
+    install_candidate(path, source)
 }
 
 /// Download a replacement dataset to a sibling candidate, validate it, then
@@ -128,40 +127,43 @@ pub fn update_data(path: &Path, source: &DataSource) -> Result<()> {
         std::fs::create_dir_all(parent).context("创建缓存目录失败")?;
     }
 
-    let raw = download_and_unpack(path, source)?;
-    let (candidate, mut candidate_file) = create_candidate(path)?;
-    let write_result = candidate_file
-        .write_all(&raw)
-        .with_context(|| format!("写入候选数据失败: {}", candidate.display()));
-    drop(candidate_file);
-    if let Err(error) = write_result {
-        return Err(cleanup_candidate_error(&candidate, error));
-    }
-
-    let validation_result = verify_dataset_file(&candidate).map(|_| ());
-    if let Err(error) = validation_result {
-        return Err(cleanup_candidate_error(&candidate, error));
-    }
-
-    finish_replacement(&candidate, replace_with_candidate(path, &candidate))
+    let _lock = operation_lock::acquire(path, operation_lock::LOCK_WAIT_TIMEOUT)?;
+    install_candidate(path, source)
 }
 
-fn download_and_unpack(path: &Path, source: &DataSource) -> Result<Vec<u8>> {
-    let gz = http_get(source.url).map_err(|e| {
-        anyhow!(
-            "{e:#}\n请手动下载:\n  {}\n解压后放到: {}",
-            source.url,
-            path.display()
-        )
-    })?;
-    if !verify_sha256(&gz, source.sha256) {
-        return Err(anyhow!(
-            "下载校验失败(sha256 不符)。请重试或手动下载:\n  {}\n解压后放到: {}",
-            source.url,
-            path.display()
-        ));
+pub fn clean_data(path: &Path) -> Result<Option<u64>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("创建缓存目录失败")?;
     }
-    gunzip(&gz)
+    let _lock = operation_lock::acquire(path, operation_lock::LOCK_WAIT_TIMEOUT)?;
+    transfer::remove_known_artifacts(path)?;
+    let size = match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("读取数据文件状态失败"),
+    };
+    if size.is_some() {
+        std::fs::remove_file(path).with_context(|| format!("删除数据失败: {}", path.display()))?;
+    }
+    Ok(size)
+}
+
+fn install_candidate(path: &Path, source: &DataSource<'_>) -> Result<()> {
+    let candidate = transfer::stage_candidate(path, source, transfer::PRODUCTION_POLICY)?;
+    if let Err(error) = verify_dataset_file(candidate.path()).map(|_| ()) {
+        return Err(candidate.cleanup_with(error));
+    }
+    if let Err(error) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(candidate.path())
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("同步候选数据失败: {}", candidate.path().display()))
+    {
+        return Err(candidate.cleanup_with(error));
+    }
+    let candidate_path = candidate.path().to_path_buf();
+    finish_replacement(candidate, replace_with_candidate(path, &candidate_path))
 }
 
 fn sibling_path(path: &Path, suffix: &str) -> Result<PathBuf> {
@@ -171,33 +173,6 @@ fn sibling_path(path: &Path, suffix: &str) -> Result<PathBuf> {
     let mut sibling = file_name.to_os_string();
     sibling.push(suffix);
     Ok(path.with_file_name(sibling))
-}
-
-fn create_candidate(path: &Path) -> Result<(PathBuf, std::fs::File)> {
-    loop {
-        let sequence = CANDIDATE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let suffix = format!(".candidate.{}.{sequence}", std::process::id());
-        let candidate = sibling_path(path, &suffix)?;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => return Ok((candidate, file)),
-            Err(ref error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("创建候选数据失败: {}", candidate.display()))
-            }
-        }
-    }
-}
-
-fn cleanup_candidate_error(candidate: &Path, error: anyhow::Error) -> anyhow::Error {
-    match remove_candidate_artifacts(candidate) {
-        Ok(()) => error,
-        Err(cleanup_error) => error.context(format!("清理候选数据失败: {cleanup_error}")),
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,39 +207,28 @@ impl ReplacementFailure {
 
 type ReplacementResult = std::result::Result<(), ReplacementFailure>;
 
-fn finish_replacement(candidate: &Path, result: ReplacementResult) -> Result<()> {
+fn finish_replacement(
+    candidate: transfer::StagedCandidate,
+    result: ReplacementResult,
+) -> Result<()> {
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            candidate.publish_succeeded();
+            Ok(())
+        }
         Err(failure) => match failure.cleanup {
-            CandidateCleanupPolicy::Remove => {
-                Err(cleanup_candidate_error(candidate, failure.error))
-            }
+            CandidateCleanupPolicy::Remove => Err(candidate.cleanup_with(failure.error)),
             #[cfg(any(test, windows))]
-            CandidateCleanupPolicy::Preserve => Err(failure.error.context(format!(
-                "validated candidate preserved at `{}`",
-                candidate.display()
-            ))),
+            CandidateCleanupPolicy::Preserve => {
+                let candidate_path = candidate.path().to_path_buf();
+                candidate.preserve();
+                Err(failure.error.context(format!(
+                    "validated candidate preserved at `{}`",
+                    candidate_path.display()
+                )))
+            }
         },
     }
-}
-
-fn remove_candidate_artifacts(candidate: &Path) -> Result<()> {
-    for suffix in ["", "-journal", "-shm", "-wal"] {
-        let artifact = if suffix.is_empty() {
-            candidate.to_path_buf()
-        } else {
-            sibling_path(candidate, suffix)?
-        };
-        match std::fs::remove_file(&artifact) {
-            Ok(()) => {}
-            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("删除候选数据失败: {}", artifact.display()))
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -330,118 +294,278 @@ fn replace_with_candidate(path: &Path, candidate: &Path) -> ReplacementResult {
         Ok(encoded)
     }
 
+    let mut backup = reserve_replacement_backup(path).map_err(ReplacementFailure::remove)?;
     let replaced = wide_path(path).map_err(ReplacementFailure::remove)?;
     let replacement = wide_path(candidate).map_err(ReplacementFailure::remove)?;
-    // SAFETY: both path buffers are NUL-terminated UTF-16 and remain alive for
-    // the call; optional and reserved pointers are null as ReplaceFileW requires.
+    let backup_name = wide_path(backup.path()).map_err(ReplacementFailure::remove)?;
+    backup
+        .prepare_for_replace()
+        .map_err(ReplacementFailure::remove)?;
+    // SAFETY: all path buffers are NUL-terminated UTF-16 and remain alive for
+    // the call; the reserved pointers are null as ReplaceFileW requires.
     let replaced_ok = unsafe {
         ReplaceFileW(
             replaced.as_ptr(),
             replacement.as_ptr(),
-            ptr::null(),
+            backup_name.as_ptr(),
             0,
             ptr::null_mut(),
             ptr::null_mut(),
         )
     };
     if replaced_ok != 0 {
+        cleanup_windows_backup_after_success(backup.path());
         return Ok(());
     }
 
     let native_error = std::io::Error::last_os_error();
-    handle_windows_replace_failure(path, candidate, native_error, |from, to| {
-        std::fs::rename(from, to)
-    })
+    handle_windows_replace_failure(
+        path,
+        candidate,
+        backup.path(),
+        native_error,
+        |from, to| std::fs::rename(from, to),
+        std::thread::sleep,
+    )
 }
 
-#[cfg(windows)]
-fn handle_windows_replace_failure<F>(
-    path: &Path,
-    candidate: &Path,
-    native_error: std::io::Error,
-    recover: F,
-) -> ReplacementResult
-where
-    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
-{
-    const ERROR_UNABLE_TO_REMOVE_REPLACED: i32 = 1175;
-    const ERROR_UNABLE_TO_MOVE_REPLACEMENT: i32 = 1176;
-    const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: i32 = 1177;
+#[cfg(any(test, windows))]
+#[derive(Debug)]
+struct ReplacementBackupReservation {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    armed: bool,
+}
 
-    match native_error.raw_os_error() {
-        Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT | ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) => {
-            match recover(candidate, path) {
-                Ok(()) => Ok(()),
-                Err(recovery_error) => Err(ReplacementFailure::preserve(anyhow!(
-                        "ReplaceFileW failed for replaced `{}` and replacement `{}` with {}; recovery rename `{} -> {}` failed with {}",
-                        path.display(),
-                        candidate.display(),
-                        describe_windows_error(&native_error),
-                        candidate.display(),
-                        path.display(),
-                        describe_windows_error(&recovery_error)
-                    ))),
-            }
+#[cfg(any(test, windows))]
+impl ReplacementBackupReservation {
+    #[cfg(windows)]
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(windows)]
+    fn prepare_for_replace(&mut self) -> Result<()> {
+        drop(self.file.take());
+        std::fs::remove_file(&self.path)
+            .with_context(|| format!("释放替换备份路径失败: {}", self.path.display()))?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+#[cfg(any(test, windows))]
+impl Drop for ReplacementBackupReservation {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
         }
-        Some(ERROR_UNABLE_TO_REMOVE_REPLACED) => Err(ReplacementFailure::remove(
-            windows_replace_error(path, candidate, &native_error),
-        )),
-        _ => Err(ReplacementFailure::remove(windows_replace_error(
-            path,
-            candidate,
-            &native_error,
-        ))),
     }
 }
 
 #[cfg(windows)]
+fn reserve_replacement_backup(live_path: &Path) -> Result<ReplacementBackupReservation> {
+    use std::sync::atomic::Ordering;
+
+    // create_new avoids stale-name collisions between cooperating fojin
+    // operations. The reservation is not a security boundary against another
+    // same-user process that can alter this directory concurrently.
+    loop {
+        let sequence = REPLACEMENT_BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = sibling_path(
+            live_path,
+            &format!(".replace-backup.{}.{sequence}", std::process::id()),
+        )?;
+        if let Some(reservation) = try_reserve_replacement_backup(&path)? {
+            return Ok(reservation);
+        }
+    }
+}
+
+#[cfg(any(test, windows))]
+fn try_reserve_replacement_backup(path: &Path) -> Result<Option<ReplacementBackupReservation>> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(ReplacementBackupReservation {
+            path: path.to_path_buf(),
+            file: Some(file),
+            armed: true,
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("保留替换备份路径失败: {}", path.display()))
+        }
+    }
+}
+
+#[cfg(any(test, windows))]
+fn cleanup_windows_backup_after_success(backup: &Path) {
+    match std::fs::remove_file(backup) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "警告: 新数据已发布,但无法删除旧数据备份 `{}`: {error}",
+            backup.display()
+        ),
+    }
+}
+
+#[cfg(any(test, windows))]
+fn handle_windows_replace_failure<F, S>(
+    path: &Path,
+    candidate: &Path,
+    backup: &Path,
+    native_error: std::io::Error,
+    mut recover: F,
+    mut sleep: S,
+) -> ReplacementResult
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+    S: FnMut(std::time::Duration),
+{
+    let original = windows_replace_error(path, candidate, backup, &native_error);
+    let live_exists = match replacement_entry_exists(path) {
+        Ok(exists) => exists,
+        Err(error) => {
+            return Err(ReplacementFailure::preserve(original.context(format!(
+                "could not inspect live path `{}` after replacement failure: {error}",
+                path.display()
+            ))));
+        }
+    };
+    let backup_exists = match replacement_entry_exists(backup) {
+        Ok(exists) => exists,
+        Err(error) => {
+            return Err(ReplacementFailure::preserve(original.context(format!(
+                "could not inspect replacement backup `{}`: {error}",
+                backup.display()
+            ))));
+        }
+    };
+
+    if live_exists {
+        let error = if backup_exists {
+            original.context(format!(
+                "live path still exists; replacement backup preserved at `{}`",
+                backup.display()
+            ))
+        } else {
+            original
+        };
+        return Err(ReplacementFailure::remove(error));
+    }
+
+    if backup_exists {
+        return match recover_with_retries(backup, path, &mut recover, &mut sleep) {
+            Ok(()) => Err(ReplacementFailure::remove(original.context(format!(
+                "old live data restored from replacement backup `{}`",
+                backup.display()
+            )))),
+            Err(recovery_error) => Err(ReplacementFailure::preserve(anyhow!(
+                "{original:#}; rollback `{}` -> `{}` failed with {}; validated candidate remains at `{}` and old live remains at `{}`. manual recovery required: restore the backup to the live path before retrying",
+                backup.display(),
+                path.display(),
+                describe_windows_error(&recovery_error),
+                candidate.display(),
+                backup.display()
+            ))),
+        };
+    }
+
+    let candidate_exists = match replacement_entry_exists(candidate) {
+        Ok(exists) => exists,
+        Err(error) => {
+            return Err(ReplacementFailure::preserve(original.context(format!(
+                "could not inspect validated candidate `{}`: {error}",
+                candidate.display()
+            ))));
+        }
+    };
+    if candidate_exists {
+        return match recover_with_retries(candidate, path, &mut recover, &mut sleep) {
+            Ok(()) => Err(ReplacementFailure::remove(original.context(format!(
+                "replacement backup was missing; validated candidate restored to live path `{}`",
+                path.display()
+            )))),
+            Err(recovery_error) => Err(ReplacementFailure::preserve(anyhow!(
+                "{original:#}; both live `{}` and backup `{}` are missing; recovery rename `{}` -> `{}` failed with {}. manual recovery required",
+                path.display(),
+                backup.display(),
+                candidate.display(),
+                path.display(),
+                describe_windows_error(&recovery_error)
+            ))),
+        };
+    }
+
+    Err(ReplacementFailure::preserve(original.context(format!(
+        "live `{}`, backup `{}`, and candidate `{}` are all missing; manual recovery required",
+        path.display(),
+        backup.display(),
+        candidate.display()
+    ))))
+}
+
+#[cfg(any(test, windows))]
+fn recover_with_retries<F, S>(
+    from: &Path,
+    to: &Path,
+    recover: &mut F,
+    sleep: &mut S,
+) -> std::io::Result<()>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+    S: FnMut(std::time::Duration),
+{
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match recover(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt < 2 {
+            sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    Err(last_error.expect("recovery attempted at least once"))
+}
+
+#[cfg(any(test, windows))]
+fn replacement_entry_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(test, windows))]
 fn windows_replace_error(
     path: &Path,
     candidate: &Path,
+    backup: &Path,
     native_error: &std::io::Error,
 ) -> anyhow::Error {
     anyhow!(
-        "ReplaceFileW failed for replaced `{}` and replacement `{}` with {}",
+        "ReplaceFileW failed for replaced `{}`, replacement `{}`, and backup `{}` with {}",
         path.display(),
         candidate.display(),
+        backup.display(),
         describe_windows_error(native_error)
     )
 }
 
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 fn describe_windows_error(error: &std::io::Error) -> String {
     match error.raw_os_error() {
         Some(code) => format!("Windows error {code}: {error}"),
         None => error.to_string(),
     }
-}
-
-fn http_get(url: &str) -> Result<Vec<u8>> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(READ_TIMEOUT)
-        .build();
-    let resp = agent
-        .get(url)
-        .call()
-        .with_context(|| format!("下载失败: {url}"))?;
-    let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
-    eprintln!("{}", download_notice(total));
-    let mut progress = Progress::new(total);
-    let mut reader = resp.into_reader();
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let n = reader.read(&mut chunk).context("读取响应失败")?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(msg) = progress.advance(n as u64) {
-            eprintln!("{msg}");
-        }
-    }
-    Ok(buf)
 }
 
 pub fn open_db(path: &Path) -> Result<rusqlite::Connection> {
@@ -681,9 +805,10 @@ mod replacement_cleanup_tests {
         let dir = tempfile::tempdir().unwrap();
         let candidate = dir.path().join("data.sqlite.candidate.1.1");
         std::fs::write(&candidate, b"validated dataset").unwrap();
+        let staged = transfer::StagedCandidate::for_test(candidate.clone());
 
         let error = finish_replacement(
-            &candidate,
+            staged,
             Err(ReplacementFailure::preserve(anyhow!(
                 "replacement recovery failed"
             ))),
@@ -701,102 +826,177 @@ mod replacement_cleanup_tests {
     }
 }
 
-#[cfg(all(test, windows))]
-mod windows_replace_failure_tests {
+#[cfg(test)]
+mod windows_replace_state_tests {
     use super::*;
-    use std::cell::Cell;
     use std::io;
 
-    const LIVE: &str = r"C:\cache\data.sqlite";
-    const CANDIDATE: &str = r"C:\cache\data.sqlite.candidate.1.1";
-
     #[test]
-    fn error_1175_returns_native_failure_without_recovery() {
-        assert_names_untouched_error_skips_recovery(1175);
+    fn errors_with_an_intact_live_path_preserve_old_content() {
+        for code in [1175, 1176, 87] {
+            let directory = tempfile::tempdir().unwrap();
+            let live = directory.path().join("data.sqlite");
+            let candidate = directory.path().join("data.sqlite.candidate.1.1");
+            let backup = directory.path().join("data.sqlite.replace-backup.1.1");
+            std::fs::write(&live, format!("old-{code}")).unwrap();
+            std::fs::write(&candidate, b"validated replacement").unwrap();
+
+            let staged = transfer::StagedCandidate::for_test(candidate.clone());
+            let result = handle_windows_replace_failure(
+                &live,
+                &candidate,
+                &backup,
+                io::Error::from_raw_os_error(code),
+                |from, to| std::fs::rename(from, to),
+                |_| {},
+            );
+            let error = finish_replacement(staged, result).unwrap_err();
+
+            assert_eq!(
+                std::fs::read(&live).unwrap(),
+                format!("old-{code}").as_bytes()
+            );
+            assert!(!candidate.exists());
+            assert!(!backup.exists());
+            assert!(format!("{error:#}").contains(&format!("Windows error {code}")));
+        }
     }
 
     #[test]
-    fn other_error_returns_native_failure_without_recovery() {
-        assert_names_untouched_error_skips_recovery(87);
-    }
+    fn error_1177_restores_old_live_from_backup_and_rejects_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let candidate = directory.path().join("data.sqlite.candidate.1.1");
+        let backup = directory.path().join("data.sqlite.replace-backup.1.1");
+        std::fs::write(&candidate, b"validated replacement").unwrap();
+        std::fs::write(&backup, b"old live").unwrap();
 
-    #[test]
-    fn error_1176_recovers_missing_live_path() {
-        assert_partial_failure_recovers(1176);
-    }
-
-    #[test]
-    fn error_1177_recovers_missing_live_path() {
-        assert_partial_failure_recovers(1177);
-    }
-
-    #[test]
-    fn error_1176_preserves_native_and_recovery_failures() {
-        assert_partial_failure_preserves_both_errors(1176);
-    }
-
-    #[test]
-    fn error_1177_preserves_native_and_recovery_failures() {
-        assert_partial_failure_preserves_both_errors(1177);
-    }
-
-    fn assert_names_untouched_error_skips_recovery(code: i32) {
-        let recovery_called = Cell::new(false);
-        let failure = handle_windows_replace_failure(
-            Path::new(LIVE),
-            Path::new(CANDIDATE),
-            io::Error::from_raw_os_error(code),
-            |_, _| {
-                recovery_called.set(true);
-                Ok(())
-            },
-        )
-        .unwrap_err();
-
-        assert!(!recovery_called.get());
-        assert_eq!(failure.cleanup, CandidateCleanupPolicy::Remove);
-        let detail = format!("{:#}", failure.error);
-        assert!(
-            detail.contains(&format!("Windows error {code}")),
-            "{detail}"
+        let staged = transfer::StagedCandidate::for_test(candidate.clone());
+        let result = handle_windows_replace_failure(
+            &live,
+            &candidate,
+            &backup,
+            io::Error::from_raw_os_error(1177),
+            |from, to| std::fs::rename(from, to),
+            |_| {},
         );
+        let error = finish_replacement(staged, result).unwrap_err();
+
+        assert_eq!(std::fs::read(&live).unwrap(), b"old live");
+        assert!(!backup.exists());
+        assert!(!candidate.exists());
+        let detail = format!("{error:#}");
+        assert!(detail.contains("Windows error 1177"), "{detail}");
+        assert!(detail.contains("restored"), "{detail}");
     }
 
-    fn assert_partial_failure_recovers(code: i32) {
-        let recovery_called = Cell::new(false);
-        handle_windows_replace_failure(
-            Path::new(LIVE),
-            Path::new(CANDIDATE),
-            io::Error::from_raw_os_error(code),
-            |from, to| {
-                recovery_called.set(true);
-                assert_eq!(from, Path::new(CANDIDATE));
-                assert_eq!(to, Path::new(LIVE));
-                Ok(())
-            },
-        )
-        .unwrap();
+    #[test]
+    fn rollback_failure_preserves_backup_and_candidate_for_manual_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let candidate = directory.path().join("data.sqlite.candidate.1.1");
+        let backup = directory.path().join("data.sqlite.replace-backup.1.1");
+        std::fs::write(&candidate, b"validated replacement").unwrap();
+        std::fs::write(&backup, b"old live").unwrap();
 
-        assert!(recovery_called.get());
-    }
-
-    fn assert_partial_failure_preserves_both_errors(code: i32) {
-        let failure = handle_windows_replace_failure(
-            Path::new(LIVE),
-            Path::new(CANDIDATE),
-            io::Error::from_raw_os_error(code),
+        let staged = transfer::StagedCandidate::for_test(candidate.clone());
+        let result = handle_windows_replace_failure(
+            &live,
+            &candidate,
+            &backup,
+            io::Error::from_raw_os_error(1177),
             |_, _| Err(io::Error::from_raw_os_error(5)),
-        )
-        .unwrap_err();
-
-        assert_eq!(failure.cleanup, CandidateCleanupPolicy::Preserve);
-        let detail = format!("{:#}", failure.error);
-        assert!(
-            detail.contains(&format!("Windows error {code}")),
-            "{detail}"
+            |_| {},
         );
-        assert!(detail.contains("Windows error 5"), "{detail}");
-        assert!(detail.contains(CANDIDATE), "{detail}");
-        assert!(detail.contains(LIVE), "{detail}");
+        let error = finish_replacement(staged, result).unwrap_err();
+
+        assert!(!live.exists());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old live");
+        assert_eq!(std::fs::read(&candidate).unwrap(), b"validated replacement");
+        let detail = format!("{error:#}");
+        for expected in [
+            "Windows error 1177",
+            "Windows error 5",
+            "manual recovery",
+            live.to_string_lossy().as_ref(),
+            backup.to_string_lossy().as_ref(),
+            candidate.to_string_lossy().as_ref(),
+        ] {
+            assert!(detail.contains(expected), "missing {expected:?}: {detail}");
+        }
+    }
+
+    #[test]
+    fn successful_replace_removes_backup_without_touching_new_live() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let candidate = directory.path().join("data.sqlite.candidate.1.1");
+        let backup = directory.path().join("data.sqlite.replace-backup.1.1");
+        std::fs::write(&live, b"new live").unwrap();
+        std::fs::write(&backup, b"old live").unwrap();
+
+        cleanup_windows_backup_after_success(&backup);
+
+        assert_eq!(std::fs::read(&live).unwrap(), b"new live");
+        assert!(!candidate.exists());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn successful_replace_keeps_a_backup_that_cannot_be_cleaned() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let backup = directory.path().join("data.sqlite.replace-backup.1.1");
+        std::fs::write(&live, b"new live").unwrap();
+        std::fs::create_dir(&backup).unwrap();
+
+        cleanup_windows_backup_after_success(&backup);
+
+        assert_eq!(std::fs::read(&live).unwrap(), b"new live");
+        assert!(backup.is_dir());
+    }
+
+    #[test]
+    fn backup_reservation_skips_a_collision_without_overwriting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let collision = directory.path().join("data.sqlite.replace-backup.1.1");
+        let available = directory.path().join("data.sqlite.replace-backup.1.2");
+        std::fs::write(&collision, b"foreign backup").unwrap();
+
+        assert!(try_reserve_replacement_backup(&collision)
+            .unwrap()
+            .is_none());
+        let reservation = try_reserve_replacement_backup(&available)
+            .unwrap()
+            .expect("next unique backup name should be reservable");
+
+        assert_eq!(std::fs::read(&collision).unwrap(), b"foreign backup");
+        assert!(available.is_file());
+        drop(reservation);
+        assert!(!available.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_replace_file_success_preserves_new_live_and_removes_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let candidate = directory.path().join("data.sqlite.candidate.1.1");
+        std::fs::write(&live, b"old live").unwrap();
+        std::fs::write(&candidate, b"new live").unwrap();
+
+        let staged = transfer::StagedCandidate::for_test(candidate.clone());
+        finish_replacement(staged, replace_with_candidate(&live, &candidate)).unwrap();
+
+        assert_eq!(std::fs::read(&live).unwrap(), b"new live");
+        assert!(!candidate.exists());
+        let prefix = "data.sqlite.replace-backup.";
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(prefix)
+        }));
     }
 }

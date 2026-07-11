@@ -1,9 +1,9 @@
 use fojin_cli::data::{
-    ensure_data, gunzip, open_compatible_db, open_read_only_db, resolve_data_path, update_data,
-    validate_compatibility, verify_dataset, verify_sha256, DataSource, EXPECTED_DATA_VERSION,
-    EXPECTED_NORM_RULESET,
+    clean_data, ensure_data, gunzip, open_compatible_db, open_read_only_db, resolve_data_path,
+    update_data, validate_compatibility, verify_dataset, verify_dataset_file, verify_sha256,
+    DataSource, EXPECTED_DATA_VERSION, EXPECTED_NORM_RULESET,
 };
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 #[test]
@@ -51,6 +51,181 @@ fn present_file_is_a_noop() {
     };
     // must NOT attempt download when file already exists
     assert!(ensure_data(&path, false, &src).is_ok());
+}
+
+#[test]
+fn ensure_data_rechecks_existence_after_waiting_for_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("data.sqlite");
+    let lock_path = sibling_path(&data, ".lock");
+    let blocker = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    blocker.lock().unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let source_url = format!("http://{}/data.gz", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0_u8; 4096];
+                    let _ = std::io::Read::read(&mut stream, &mut request);
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    return 1_usize;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return 0;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        }
+    });
+
+    let worker_data = data.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let source = DataSource {
+            url: &source_url,
+            sha256: "unused",
+        };
+        sender
+            .send(ensure_data(&worker_data, false, &source))
+            .unwrap();
+    });
+
+    let early = receiver.recv_timeout(std::time::Duration::from_millis(100));
+    let waited_for_lock = matches!(&early, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+    std::fs::write(&data, b"installed by competing process").unwrap();
+    drop(blocker);
+
+    let result = match early {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("ensure_data remained blocked after the lock was released"),
+        Err(error) => panic!("ensure_data worker disconnected: {error}"),
+    };
+    worker.join().unwrap();
+    let requests = server.join().unwrap();
+    assert!(
+        waited_for_lock,
+        "ensure_data did not wait for the operation lock: {result:?}"
+    );
+    assert_eq!(requests, 0, "lock waiter attempted a redundant download");
+    result.unwrap();
+    assert_eq!(
+        std::fs::read(data).unwrap(),
+        b"installed by competing process"
+    );
+}
+
+#[test]
+fn clean_data_waits_for_operation_lock_before_deleting() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("data.sqlite");
+    std::fs::write(&data, b"live").unwrap();
+    let lock_path = sibling_path(&data, ".lock");
+    let blocker = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    blocker.lock().unwrap();
+
+    let worker_data = data.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        sender.send(clean_data(&worker_data)).unwrap();
+    });
+
+    assert!(matches!(
+        receiver.recv_timeout(std::time::Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert!(data.is_file(), "clean deleted live data without the lock");
+    drop(blocker);
+
+    assert_eq!(
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("clean remained blocked after the lock was released")
+            .unwrap(),
+        Some(4)
+    );
+    worker.join().unwrap();
+    assert!(!data.exists());
+    assert!(lock_path.is_file());
+}
+
+#[test]
+fn clean_data_removes_known_file_artifacts_and_preserves_other_entries() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("data.sqlite");
+    let legacy = data.with_extension("tmp");
+    let download = sibling_path(&data, ".download.123.0.gz");
+    let candidate = sibling_path(&data, ".candidate.123.1");
+    let candidate_journal = sibling_path(&data, ".candidate.123.1-journal");
+    let matching_directory = sibling_path(&data, ".download.keep");
+    let lock_path = sibling_path(&data, ".lock");
+    let unrelated = sibling_path(&data, ".unrelated");
+    let lookalikes = [
+        sibling_path(&data, ".candidate.notes"),
+        sibling_path(&data, ".candidate.123"),
+        sibling_path(&data, ".candidate.123.x"),
+        sibling_path(&data, ".candidate.123.1.notes"),
+        sibling_path(&data, ".candidate.123.1-journal.notes"),
+        sibling_path(&data, ".download.123.0"),
+        sibling_path(&data, ".download.123.x.gz"),
+        sibling_path(&data, ".download.123.0.gz.notes"),
+    ];
+    std::fs::write(&data, b"live").unwrap();
+    for artifact in [&legacy, &download, &candidate, &candidate_journal] {
+        std::fs::write(artifact, b"temporary").unwrap();
+    }
+    std::fs::create_dir(&matching_directory).unwrap();
+    std::fs::write(&lock_path, b"permanent lock inode").unwrap();
+    std::fs::write(&unrelated, b"unrelated").unwrap();
+    for lookalike in &lookalikes {
+        std::fs::write(lookalike, b"not owned").unwrap();
+    }
+
+    assert_eq!(clean_data(&data).unwrap(), Some(4));
+    for removed in [&data, &legacy, &download, &candidate, &candidate_journal] {
+        assert!(!removed.exists(), "artifact remains: {}", removed.display());
+    }
+    assert!(matching_directory.is_dir());
+    assert_eq!(std::fs::read(&lock_path).unwrap(), b"permanent lock inode");
+    assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated");
+    for lookalike in &lookalikes {
+        assert_eq!(
+            std::fs::read(lookalike).unwrap(),
+            b"not owned",
+            "clean removed lookalike: {}",
+            lookalike.display()
+        );
+    }
+
+    assert_eq!(clean_data(&data).unwrap(), None);
+    assert!(lock_path.is_file());
+    assert!(matching_directory.is_dir());
+    assert!(unrelated.is_file());
+    assert!(lookalikes.iter().all(|path| path.is_file()));
 }
 
 #[test]
@@ -106,17 +281,11 @@ fn download_notice_mentions_size_and_offline() {
 }
 
 /// Serve one HTTP response on localhost and exercise the full download path:
-/// stream -> sha256 verify -> gunzip -> atomic write. No external network.
+/// stream -> sha256 verify -> bounded gunzip -> verified publication. No external network.
 #[test]
 fn ensure_data_downloads_verifies_and_unpacks() {
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(b"fake sqlite payload").unwrap();
-    let gz = enc.finish().unwrap();
-
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(&gz);
-    let sha: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let gz = gzip_bytes(&replacement_database_bytes());
+    let sha = sha256_hex(&gz);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -142,11 +311,291 @@ fn ensure_data_downloads_verifies_and_unpacks() {
     ensure_data(&path, false, &source).unwrap();
     server.join().unwrap();
 
-    assert_eq!(std::fs::read(&path).unwrap(), b"fake sqlite payload");
-    assert!(
-        !path.with_extension("tmp").exists(),
-        "temp file must not linger"
-    );
+    verify_dataset_file(&path).unwrap();
+}
+
+#[test]
+fn concurrent_first_install_downloads_once() {
+    if std::env::var_os("FOJIN_CONCURRENT_WORKER").is_some() {
+        let path = PathBuf::from(std::env::var_os("FOJIN_WORKER_DATA").unwrap());
+        let url = std::env::var("FOJIN_WORKER_URL").unwrap();
+        let sha = std::env::var("FOJIN_WORKER_SHA256").unwrap();
+        ensure_data(
+            &path,
+            false,
+            &DataSource {
+                url: &url,
+                sha256: &sha,
+            },
+        )
+        .unwrap();
+        return;
+    }
+    use std::fs::OpenOptions;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn terminate_children(children: [&mut Child; 2]) {
+        for child in children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn wait_for_children(mut children: [&mut Child; 2], timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut finished = [false; 2];
+        while !finished.iter().all(|done| *done) {
+            let mut failed = None;
+            for (index, child) in children.iter_mut().enumerate() {
+                if finished[index] {
+                    continue;
+                }
+                if let Some(status) = child.try_wait().unwrap() {
+                    finished[index] = true;
+                    if !status.success() {
+                        failed = Some((index, status));
+                        break;
+                    }
+                }
+            }
+            if let Some((failed_index, status)) = failed {
+                for (index, child) in children.iter_mut().enumerate() {
+                    if !finished[index] {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+                panic!("worker {failed_index} failed with {status}");
+            }
+            if Instant::now() >= deadline {
+                for (index, child) in children.iter_mut().enumerate() {
+                    if !finished[index] {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+                panic!("concurrent install workers exceeded {timeout:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let data_path = directory.path().join("data.sqlite");
+    let lock_path = sibling_path(&data_path, ".lock");
+    let parent_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    parent_lock.lock().unwrap();
+    let body = gzip_bytes(&replacement_database_bytes());
+    let sha = sha256_hex(&body);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/data.gz", listener.local_addr().unwrap());
+    let server_body = body.clone();
+    let (request_started_tx, request_started_rx) = std::sync::mpsc::channel();
+    let (early_request_count_tx, early_request_count_rx) = std::sync::mpsc::channel();
+    let (release_response_tx, release_response_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut requests = 0_usize;
+        let accept_deadline = Instant::now() + Duration::from_secs(5);
+        let mut first = loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    break stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < accept_deadline,
+                        "no worker began the first download"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+        requests += 1;
+        let mut request = [0_u8; 4096];
+        let _ = first.read(&mut request);
+        request_started_tx.send(()).unwrap();
+
+        let early_deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < early_deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    requests += 1;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let _ = stream.read(&mut request);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        }
+        early_request_count_tx.send(requests).unwrap();
+        release_response_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("parent did not release the first response");
+
+        write!(
+            first,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            server_body.len()
+        )
+        .unwrap();
+        first.write_all(&server_body).unwrap();
+        drop(first);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    requests += 1;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let _ = stream.read(&mut request);
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        server_body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&server_body).unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        }
+        requests
+    });
+
+    let first_log = directory.path().join("worker-1.stderr");
+    let second_log = directory.path().join("worker-2.stderr");
+    let spawn_worker = |stderr_path: &std::path::Path| {
+        Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("concurrent_first_install_downloads_once")
+            .arg("--nocapture")
+            .env("FOJIN_CONCURRENT_WORKER", "1")
+            .env("FOJIN_WORKER_DATA", &data_path)
+            .env("FOJIN_WORKER_URL", &url)
+            .env("FOJIN_WORKER_SHA256", &sha)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(stderr_path).unwrap()))
+            .spawn()
+            .unwrap()
+    };
+    let mut first = spawn_worker(&first_log);
+    let mut second = spawn_worker(&second_log);
+
+    let barrier_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let first_stderr = std::fs::read_to_string(&first_log).unwrap_or_default();
+        let second_stderr = std::fs::read_to_string(&second_log).unwrap_or_default();
+        let marker = "检测到另一个 fojin 数据操作,正在等待";
+        if first_stderr.contains(marker) && second_stderr.contains(marker) {
+            break;
+        }
+        if Instant::now() >= barrier_deadline {
+            let _ = first.kill();
+            let _ = second.kill();
+            let _ = first.wait();
+            let _ = second.wait();
+            panic!(
+                "workers did not reach the lock barrier; first={first_stderr:?}, second={second_stderr:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    drop(parent_lock);
+    if let Err(error) = request_started_rx.recv_timeout(Duration::from_secs(5)) {
+        let _ = release_response_tx.send(());
+        terminate_children([&mut first, &mut second]);
+        let _ = server.join();
+        panic!("neither worker began downloading after the parent released the lock: {error}");
+    }
+    let early_requests = match early_request_count_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(requests) => requests,
+        Err(error) => {
+            let _ = release_response_tx.send(());
+            terminate_children([&mut first, &mut second]);
+            let _ = server.join();
+            panic!("server did not report the pre-release request count: {error}");
+        }
+    };
+    if early_requests != 1 {
+        let _ = release_response_tx.send(());
+        terminate_children([&mut first, &mut second]);
+        let _ = server.join();
+        panic!("both workers downloaded while the first response was blocked");
+    }
+    let first_early = first.try_wait().unwrap();
+    let second_early = second.try_wait().unwrap();
+    if first_early.is_some() || second_early.is_some() {
+        let _ = release_response_tx.send(());
+        terminate_children([&mut first, &mut second]);
+        let _ = server.join();
+        panic!("a worker exited before the first download was released");
+    }
+    if release_response_tx.send(()).is_err() {
+        terminate_children([&mut first, &mut second]);
+        let _ = server.join();
+        panic!("server exited before the first response was released");
+    }
+
+    wait_for_children([&mut first, &mut second], Duration::from_secs(10));
+    assert_eq!(server.join().unwrap(), 1);
+    verify_dataset_file(&data_path).unwrap();
+    assert_no_owned_transfer_artifacts(&data_path);
+}
+
+#[test]
+fn first_install_rejects_incompatible_database() {
+    let gz = gzip_bytes(b"fake sqlite payload");
+    let sha = sha256_hex(&gz);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = gz.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let _ = std::io::Read::read(&mut stream, &mut request);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/gzip\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    let source = DataSource {
+        url: &format!("http://127.0.0.1:{port}/data.gz"),
+        sha256: &sha,
+    };
+    let error = ensure_data(&path, false, &source).unwrap_err().to_string();
+    server.join().unwrap();
+
+    assert!(error.contains("dataset incompatibility"), "got: {error}");
+    assert!(!path.exists(), "incompatible dataset was published");
+    assert_no_owned_transfer_artifacts(&path);
 }
 
 #[test]
@@ -479,11 +928,15 @@ fn update_data_preserves_live_dataset_when_candidate_fails_compatibility() {
 
     assert!(err.contains("dataset incompatibility"), "got: {err}");
     assert_eq!(std::fs::read(&path).unwrap(), b"live dataset");
-    let entries: Vec<_> = std::fs::read_dir(dir.path())
+    let entries: std::collections::BTreeSet<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect();
-    assert_eq!(entries, vec![std::ffi::OsString::from("data.sqlite")]);
+    let expected: std::collections::BTreeSet<_> = ["data.sqlite", "data.sqlite.lock"]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+    assert_eq!(entries, expected);
 }
 
 #[test]
@@ -498,6 +951,103 @@ fn update_data_replaces_valid_existing_dataset() {
 
     assert_replacement_marker(&path);
     assert_no_candidate_artifacts(&path);
+}
+
+#[test]
+fn update_download_keeps_live_dataset_readable_without_query_locking() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("data.sqlite");
+    let live = compatible_database_bytes(|connection| {
+        connection
+            .execute("INSERT INTO meta(key, value) VALUES ('marker', 'live')", [])
+            .unwrap();
+    });
+    std::fs::write(&data, live).unwrap();
+
+    let replacement = gzip_bytes(&replacement_database_bytes());
+    let sha = sha256_hex(&replacement);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let source_url = format!("http://{}/data.gz", listener.local_addr().unwrap());
+    let (midpoint_sender, midpoint_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = std::io::Read::read(&mut stream, &mut request);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            replacement.len()
+        )
+        .unwrap();
+        let midpoint = replacement.len() / 2;
+        stream.write_all(&replacement[..midpoint]).unwrap();
+        stream.flush().unwrap();
+        midpoint_sender.send(()).unwrap();
+        release_receiver.recv().unwrap();
+        stream.write_all(&replacement[midpoint..]).unwrap();
+    });
+
+    let update_path = data.clone();
+    let updater = std::thread::spawn(move || {
+        update_data(
+            &update_path,
+            &DataSource {
+                url: &source_url,
+                sha256: &sha,
+            },
+        )
+    });
+    midpoint_receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("updater did not begin its download");
+
+    let lock_path = sibling_path(&data, ".lock");
+    let lock_probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    let update_holds_lock = match lock_probe.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Ok(()) => false,
+        Err(std::fs::TryLockError::Error(error)) => {
+            panic!("probing the update operation lock failed: {error}")
+        }
+    };
+    drop(lock_probe);
+
+    let query_path = data.clone();
+    let (query_sender, query_receiver) = std::sync::mpsc::channel();
+    let query = std::thread::spawn(move || {
+        let result = (|| {
+            let connection = open_compatible_db(&query_path)?;
+            let marker =
+                connection.query_row("SELECT value FROM meta WHERE key = 'marker'", [], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            Ok::<_, anyhow::Error>(marker)
+        })();
+        query_sender.send(result).unwrap();
+    });
+    let live_marker = query_receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("ordinary query waited for the data operation lock")
+        .unwrap();
+    query.join().unwrap();
+
+    release_sender.send(()).unwrap();
+    server.join().unwrap();
+    let update_result = updater.join().unwrap();
+    assert!(
+        update_holds_lock,
+        "update_data did not hold the operation lock while downloading"
+    );
+    assert_eq!(live_marker, "live");
+    update_result.unwrap();
+    assert_replacement_marker(&data);
 }
 
 #[test]
@@ -561,7 +1111,7 @@ fn update_data_preserves_live_dataset_on_decompression_failure() {
         .unwrap_err()
         .to_string();
 
-    assert!(err.contains("解压 gzip 失败"), "got: {err}");
+    assert!(err.contains("解压 gzip"), "got: {err}");
     assert_eq!(std::fs::read(&path).unwrap(), b"old live dataset");
     assert_no_candidate_artifacts(&path);
 }
@@ -733,22 +1283,51 @@ fn assert_no_candidate_artifacts(path: &std::path::Path) {
             artifact.display()
         );
     }
-    assert_no_owned_candidate_artifacts(path);
+    assert_no_owned_transfer_artifacts(path);
 }
 
-fn assert_no_owned_candidate_artifacts(path: &std::path::Path) {
-    let mut prefix = path.file_name().unwrap().to_os_string();
-    prefix.push(".candidate.");
-    let prefix = prefix.to_string_lossy();
+fn assert_no_owned_transfer_artifacts(path: &std::path::Path) {
+    let live_name = path.file_name().unwrap().to_string_lossy();
     let owned: Vec<_> = std::fs::read_dir(path.parent().unwrap())
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
-        .filter(|name| name.to_string_lossy().starts_with(prefix.as_ref()))
+        .filter(|name| {
+            let name = name.to_string_lossy();
+            let Some(suffix) = name.strip_prefix(live_name.as_ref()) else {
+                return false;
+            };
+            if let Some(generation) = suffix
+                .strip_prefix(".download.")
+                .and_then(|rest| rest.strip_suffix(".gz"))
+            {
+                return is_numeric_generation(generation);
+            }
+            let Some(candidate) = suffix.strip_prefix(".candidate.") else {
+                return false;
+            };
+            let generation = ["-journal", "-shm", "-wal"]
+                .into_iter()
+                .find_map(|sidecar| candidate.strip_suffix(sidecar))
+                .unwrap_or(candidate);
+            is_numeric_generation(generation)
+        })
         .collect();
     assert!(
         owned.is_empty(),
-        "owned candidate artifacts remain: {owned:?}"
+        "owned transfer artifacts remain: {owned:?}"
     );
+}
+
+fn is_numeric_generation(value: &str) -> bool {
+    let mut parts = value.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(pid), Some(sequence), None)
+            if !pid.is_empty()
+                && !sequence.is_empty()
+                && pid.bytes().all(|byte| byte.is_ascii_digit())
+                && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    )
 }
 
 fn sibling_path(path: &std::path::Path, suffix: &str) -> PathBuf {

@@ -293,12 +293,15 @@ fn data_status_reports_missing_data_without_downloading() {
 fn data_clean_removes_file_and_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     write_fixture_db(dir.path());
+    let lock_path = dir.path().join("data.sqlite.lock");
     let out = run_fojin(&["data", "clean"], dir.path());
     assert_eq!(out.status.code(), Some(0));
     assert!(!dir.path().join("data.sqlite").exists());
+    assert!(lock_path.is_file());
     let out2 = run_fojin(&["data", "clean"], dir.path());
     assert_eq!(out2.status.code(), Some(0));
     assert!(String::from_utf8(out2.stdout).unwrap().contains("无数据"));
+    assert!(lock_path.is_file());
 }
 
 #[test]

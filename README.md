@@ -184,6 +184,10 @@ fojin parallel "<汉文短语>" --json --offline
 - 来源:Dharmamitra 的 [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) 对齐数据集([Nehrdich & Keutzer, 2026](https://arxiv.org/pdf/2601.06400)),以 GitHub Release(`data-v1`)形式分发;学术使用请引用原论文(BibTeX 见 [`DATA_LICENSE`](DATA_LICENSE))。
 - 当前二进制把官方下载地址、SHA-256 与兼容元数据固定在 `data-v1`;`fojin data update` 只会重新获取这份固定数据,不会自动切换到未来的数据主版本。版本、归一化规则或查询所需 schema 不兼容的数据会被拒绝。
 - 首次运行时下载,压缩包约 **183 MB**,解压后约 **561 MB**(SQLite)。下载后完全离线可用。
+- 安装和更新采用有界的磁盘流式传输,不再在内存中缓冲完整压缩包或数据库;压缩响应上限为 **256 MiB**,解压后的数据库上限为 **768 MiB**。更新期间可能临时需要现用数据库所占空间,外加约 **744 MiB** 暂存磁盘空间(约 183 MiB 压缩包 + 约 561 MiB 候选数据库)。
+- HTTP DNS 解析与连接超时均为 **30 秒**,响应头和响应体的空闲读取超时均为 **60 秒**,并以跨重定向、覆盖 DNS 到响应体读取的 **15 分钟端到端硬时限** 为上限。
+- 同一数据目录上的首次安装、更新和清理操作按 single-flight 串行执行;等待者最多等待 **20 分钟**。永久保留的 `data.sqlite.lock` 文件是无害的协调文件,`fojin data clean` 会有意保留它。
+- 离线查询行为及固定到 `data-v1` 的校验和契约保持不变。
 - 当前不含巴利对齐(上游 MITRA-parallel 尚未覆盖巴利),默认输出不显示巴利行;显式 `--lang pi` 仍可查询(如实答「未找到对齐」)。程序的渲染路径可兼容未来新增语言行,但当前官方下载通道仍固定为 `data-v1`;上游出现新语言不代表当前二进制会自动获得它。**渲染兼容不等于官方更新通道无需升级**,未来数据版本可能要求升级二进制或明确切换数据发布。
 - 许可:**CC BY-SA 4.0**(Dharmamitra + fojin)。
 - 范围:仅含 MITRA 跨藏平行;fojin 自有的精选对齐(alignment_pairs)**未包含**在本数据集中。
@@ -219,6 +223,10 @@ fojin data verify                 # verify version, SQLite, and FTS integrity
 - **Build/install integrity**: building from crates.io or source requires Rust 1.95+ (MSRV 1.95). Starting with v0.3.0, the shell installer requires the target binary release to provide `SHA256SUMS` and verifies the archive before extraction. It fails closed for an older latest or explicitly selected release without that file, including the transition before v0.3.0 is published; use the currently published crates.io version or a source build instead. This does not state that v0.3.0 has been released.
 - **For AI agents**: pure-JSON stdout, semantic exit codes (`0` ok / `1` runtime / `2` usage), zero network with `--offline`. Ready-made Claude Code integration in [`examples/claude/`](examples/claude/).
 - **Data**: 908,620 zh↔sa/bo alignments from Dharmamitra's [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) dataset, redistributed under CC BY-SA 4.0. The official URL, checksum, and compatibility contract remain pinned to `data-v1`; rendering support for future language rows does not mean the official update channel can adopt them without a binary upgrade. Academic use: please cite [Nehrdich & Keutzer (2026)](https://arxiv.org/pdf/2601.06400) — BibTeX in [`DATA_LICENSE`](DATA_LICENSE).
+- **Data transfer resources**: installs and updates use bounded, disk-streamed transfers and no longer buffer the complete archive or database in memory. Compressed responses are capped at **256 MiB** and decompressed databases at **768 MiB**. An update can temporarily require the live database plus roughly **744 MiB** of staging disk (about 183 MiB for the archive and 561 MiB for the candidate database).
+- **Data timeouts**: HTTP DNS resolution and connection timeouts are both **30 seconds**, response-header and response-body idle-read timeouts are both **60 seconds**, and a **15-minute hard end-to-end deadline** spans redirects from DNS through the final body read.
+- **Concurrent data operations**: initial install, update, and clean operations on one data directory are single-flight; a waiter may wait up to **20 minutes**. The permanent `data.sqlite.lock` file is harmless coordination state and intentionally survives `fojin data clean`.
+- **Stable query contract**: offline queries and the checksum contract pinned to `data-v1` are unchanged.
 - **Not in scope**: semantic search, Pāli, translation — use [Dharmamitra](https://dharmamitra.org)'s online APIs for those; the two are complementary.
 - **License**: code MIT OR Apache-2.0; data CC BY-SA 4.0.
 
