@@ -15,13 +15,14 @@ static ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // Ureq's socket adapter turns an already-expired zero timeout into one second
 // because operating systems reject a zero socket timeout. TLS can also perform
 // several lower-level reads for one HTTP-level read while reusing the original
-// timeout. Recompute the absolute deadline and the per-read idle timeout at
-// both transport layers so neither buffered protocol bytes nor a dribbling TLS
-// record can extend the configured boundary. The transport API is unversioned,
-// so ureq is pinned exactly in Cargo.toml.
+// timeout. Recompute the global and connection-phase deadlines plus the
+// per-read idle timeout at both transport layers so neither buffered protocol
+// bytes nor a dribbling TLS record can extend a configured boundary. The
+// transport API is unversioned, so ureq is pinned exactly in Cargo.toml.
 #[derive(Clone, Copy, Debug)]
 struct AbsoluteDeadlineConnector {
     deadline: StdInstant,
+    connect_timeout: Duration,
     idle_read_timeout: Duration,
 }
 
@@ -29,6 +30,9 @@ struct AbsoluteDeadlineConnector {
 struct AbsoluteDeadlineTransport<T> {
     inner: T,
     deadline: StdInstant,
+    connect_timeout: Duration,
+    connect_phase_deadline: StdInstant,
+    connect_phase_active: bool,
     idle_read_timeout: Duration,
 }
 
@@ -39,14 +43,57 @@ impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::C
 
     fn connect(
         &self,
-        _: &ureq::unversioned::transport::ConnectionDetails<'_>,
+        details: &ureq::unversioned::transport::ConnectionDetails<'_>,
         chained: Option<T>,
     ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+        // ConnectionDetails::now is captured before the connector chain runs,
+        // so this includes TCP and CONNECT-proxy work that preceded this
+        // wrapper instead of restarting the budget after the socket opened.
+        let connect_phase_started = match details.now {
+            ureq::unversioned::transport::time::Instant::Exact(started) => started,
+            _ => {
+                return Err(ureq::Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP transport did not provide an exact connection start time",
+                )));
+            }
+        };
+        let connect_phase_deadline = checked_deadline(connect_phase_started, self.connect_timeout)?;
         Ok(chained.map(|inner| AbsoluteDeadlineTransport {
             inner,
             deadline: self.deadline,
+            connect_timeout: self.connect_timeout,
+            connect_phase_deadline,
+            connect_phase_active: true,
             idle_read_timeout: self.idle_read_timeout,
         }))
+    }
+}
+
+impl<T> AbsoluteDeadlineTransport<T> {
+    fn bound_timeout(
+        &mut self,
+        timeout: ureq::unversioned::transport::NextTimeout,
+        idle_read_timeout: Option<Duration>,
+    ) -> std::result::Result<ureq::unversioned::transport::NextTimeout, ureq::Error> {
+        let now = StdInstant::now();
+        let connect_deadline = if timeout.reason == ureq::Timeout::Connect {
+            if !self.connect_phase_active {
+                self.connect_phase_deadline = checked_deadline(now, self.connect_timeout)?;
+                self.connect_phase_active = true;
+            }
+            Some(self.connect_phase_deadline)
+        } else {
+            self.connect_phase_active = false;
+            None
+        };
+        Ok(bound_transport_timeout(
+            timeout,
+            self.deadline,
+            connect_deadline,
+            idle_read_timeout,
+            now,
+        ))
     }
 }
 
@@ -62,7 +109,7 @@ impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::T
         amount: usize,
         timeout: ureq::unversioned::transport::NextTimeout,
     ) -> std::result::Result<(), ureq::Error> {
-        let timeout = bound_transport_timeout(timeout, self.deadline, None);
+        let timeout = self.bound_timeout(timeout, None)?;
         require_remaining_timeout(timeout)?;
         self.inner.transmit_output(amount, timeout)
     }
@@ -71,7 +118,7 @@ impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::T
         &mut self,
         timeout: ureq::unversioned::transport::NextTimeout,
     ) -> std::result::Result<bool, ureq::Error> {
-        let timeout = bound_transport_timeout(timeout, self.deadline, Some(self.idle_read_timeout));
+        let timeout = self.bound_timeout(timeout, Some(self.idle_read_timeout))?;
         require_remaining_timeout(timeout)?;
         self.inner.maybe_await_input(timeout)
     }
@@ -80,7 +127,7 @@ impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::T
         &mut self,
         timeout: ureq::unversioned::transport::NextTimeout,
     ) -> std::result::Result<bool, ureq::Error> {
-        let timeout = bound_transport_timeout(timeout, self.deadline, Some(self.idle_read_timeout));
+        let timeout = self.bound_timeout(timeout, Some(self.idle_read_timeout))?;
         require_remaining_timeout(timeout)?;
         self.inner.await_input(timeout)
     }
@@ -97,15 +144,28 @@ impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::T
 fn bound_transport_timeout(
     mut timeout: ureq::unversioned::transport::NextTimeout,
     deadline: StdInstant,
+    connect_deadline: Option<StdInstant>,
     idle_read_timeout: Option<Duration>,
+    now: StdInstant,
 ) -> ureq::unversioned::transport::NextTimeout {
-    let remaining = deadline.saturating_duration_since(StdInstant::now());
+    let remaining = deadline.saturating_duration_since(now);
     let global_after: ureq::unversioned::transport::time::Duration = remaining.into();
     if global_after < timeout.after {
         timeout = ureq::unversioned::transport::NextTimeout {
             after: global_after,
             reason: ureq::Timeout::Global,
         };
+    }
+
+    if let Some(connect_deadline) = connect_deadline {
+        let remaining = connect_deadline.saturating_duration_since(now);
+        let connect_after: ureq::unversioned::transport::time::Duration = remaining.into();
+        if connect_after < timeout.after {
+            timeout = ureq::unversioned::transport::NextTimeout {
+                after: connect_after,
+                reason: ureq::Timeout::Connect,
+            };
+        }
     }
 
     if let Some(idle_read_timeout) = idle_read_timeout {
@@ -119,6 +179,18 @@ fn bound_transport_timeout(
     }
 
     timeout
+}
+
+fn checked_deadline(
+    started: StdInstant,
+    timeout: Duration,
+) -> std::result::Result<StdInstant, ureq::Error> {
+    started.checked_add(timeout).ok_or_else(|| {
+        ureq::Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HTTP timeout exceeds the system clock range",
+        ))
+    })
 }
 
 fn require_remaining_timeout(
@@ -517,6 +589,7 @@ fn stage_candidate_inner(
     use ureq::unversioned::transport::Connector;
     let deadline_connector = AbsoluteDeadlineConnector {
         deadline,
+        connect_timeout: policy.connect_timeout,
         idle_read_timeout: policy.idle_read_timeout,
     };
     let connector =
@@ -1032,20 +1105,26 @@ mod tests {
     }
 
     fn contains_ureq_timeout(error: &anyhow::Error, expected: ureq::Timeout) -> bool {
-        error.chain().any(|cause| {
-            let direct = matches!(
-                cause.downcast_ref::<ureq::Error>(),
-                Some(ureq::Error::Timeout(reason)) if *reason == expected
-            );
-            let wrapped = cause
+        fn source_contains_timeout(
+            source: &(dyn std::error::Error + 'static),
+            expected: ureq::Timeout,
+        ) -> bool {
+            if let Some(source) = source.downcast_ref::<ureq::Error>() {
+                return match source {
+                    ureq::Error::Timeout(reason) => *reason == expected,
+                    ureq::Error::Io(source) => source_contains_timeout(source, expected),
+                    _ => false,
+                };
+            }
+            source
                 .downcast_ref::<io::Error>()
                 .and_then(io::Error::get_ref)
-                .and_then(|source| source.downcast_ref::<ureq::Error>())
-                .is_some_and(
-                    |source| matches!(source, ureq::Error::Timeout(reason) if *reason == expected),
-                );
-            direct || wrapped
-        })
+                .is_some_and(|source| source_contains_timeout(source, expected))
+        }
+
+        error
+            .chain()
+            .any(|cause| source_contains_timeout(cause, expected))
     }
 
     fn assert_no_owned_transfer_artifacts(live: &Path) {
@@ -1123,8 +1202,8 @@ mod tests {
     #[test]
     fn total_timeout_stops_a_non_idle_dribble() {
         let policy = DownloadPolicy {
-            connect_timeout: Duration::from_millis(200),
-            idle_read_timeout: Duration::from_millis(150),
+            connect_timeout: Duration::from_secs(1),
+            idle_read_timeout: Duration::from_millis(600),
             http_timeout: Duration::from_millis(300),
             max_compressed: 1024,
             max_uncompressed: 4096,
@@ -1136,6 +1215,10 @@ mod tests {
         );
         assert!(
             contains_io_kind(&error, io::ErrorKind::TimedOut),
+            "got: {error:#}"
+        );
+        assert!(
+            contains_ureq_timeout(&error, ureq::Timeout::Global),
             "got: {error:#}"
         );
     }
@@ -1170,7 +1253,7 @@ mod tests {
         let url = format!("http://{address}/data.gz");
         let policy = DownloadPolicy {
             connect_timeout: Duration::from_millis(500),
-            idle_read_timeout: Duration::from_millis(120),
+            idle_read_timeout: Duration::from_millis(250),
             http_timeout: Duration::from_secs(2),
             max_compressed: 1024,
             max_uncompressed: 4096,
@@ -1246,10 +1329,65 @@ mod tests {
     }
 
     #[test]
+    fn connect_deadline_interrupts_a_dribbling_tls_record() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nodelay(true).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut client_hello = [0_u8; 16 * 1024];
+            let _ = stream.read(&mut client_hello).unwrap();
+            stream.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).unwrap();
+            stream.flush().unwrap();
+            for _ in 0..24 {
+                if stream.write_all(&[0]).is_err() || stream.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("data.sqlite");
+        let url = format!("https://{address}/data.gz");
+        let sha = "0".repeat(64);
+        let policy = DownloadPolicy {
+            connect_timeout: Duration::from_millis(250),
+            idle_read_timeout: Duration::from_secs(1),
+            http_timeout: Duration::from_secs(2),
+            max_compressed: 1024,
+            max_uncompressed: 4096,
+        };
+
+        let started = Instant::now();
+        let error = stage_candidate(
+            &live,
+            &DataSource {
+                url: &url,
+                sha256: &sha,
+            },
+            policy,
+        )
+        .map(drop)
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(elapsed < Duration::from_millis(700), "elapsed: {elapsed:?}");
+        assert!(
+            contains_ureq_timeout(&error, ureq::Timeout::Connect),
+            "got: {error:#}"
+        );
+        assert_no_owned_transfer_artifacts(&live);
+    }
+
+    #[test]
     fn global_timeout_interrupts_continuously_dribbling_response_headers() {
         let policy = DownloadPolicy {
-            connect_timeout: Duration::from_millis(200),
-            idle_read_timeout: Duration::from_millis(200),
+            connect_timeout: Duration::from_secs(1),
+            idle_read_timeout: Duration::from_millis(500),
             http_timeout: Duration::from_millis(250),
             max_compressed: 1024,
             max_uncompressed: 4096,
@@ -1269,6 +1407,10 @@ mod tests {
             "got: {error:#}"
         );
         assert!(
+            contains_ureq_timeout(&error, ureq::Timeout::Global),
+            "got: {error:#}"
+        );
+        assert!(
             format!("{error:#}").contains("请手动下载"),
             "got: {error:#}"
         );
@@ -1277,8 +1419,8 @@ mod tests {
     #[test]
     fn global_timeout_interrupts_continuously_dribbling_chunk_framing() {
         let policy = DownloadPolicy {
-            connect_timeout: Duration::from_millis(200),
-            idle_read_timeout: Duration::from_millis(200),
+            connect_timeout: Duration::from_secs(1),
+            idle_read_timeout: Duration::from_millis(500),
             http_timeout: Duration::from_millis(250),
             max_compressed: 1024,
             max_uncompressed: 4096,
@@ -1295,6 +1437,10 @@ mod tests {
         assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
         assert!(
             contains_io_kind(&error, io::ErrorKind::TimedOut),
+            "got: {error:#}"
+        );
+        assert!(
+            contains_ureq_timeout(&error, ureq::Timeout::Global),
             "got: {error:#}"
         );
         assert!(
@@ -1375,6 +1521,10 @@ mod tests {
         assert!(error.to_string().contains("读取响应失败"), "got: {error:#}");
         assert!(
             contains_io_kind(&error, io::ErrorKind::TimedOut),
+            "got: {error:#}"
+        );
+        assert!(
+            contains_ureq_timeout(&error, ureq::Timeout::RecvBody),
             "got: {error:#}"
         );
         let detail = format!("{error:#}");
