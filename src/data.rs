@@ -575,17 +575,21 @@ pub fn dataset_stats(conn: &rusqlite::Connection) -> Result<DatasetStats> {
                 other => Err(other),
             })?)
     };
-    let total: u64 = conn.query_row("SELECT COUNT(*) FROM parallels", [], |r| r.get(0))?;
+    let count = |row: &rusqlite::Row<'_>, index: usize| -> rusqlite::Result<u64> {
+        let value = row.get::<_, i64>(index)?;
+        u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+    };
+    let total = conn.query_row("SELECT COUNT(*) FROM parallels", [], |r| count(r, 0))?;
     let texts: u64 = conn.query_row(
         "SELECT COUNT(DISTINCT cbeta_id) FROM parallels WHERE cbeta_id IS NOT NULL",
         [],
-        |r| r.get(0),
+        |r| count(r, 0),
     )?;
     let mut stmt = conn.prepare(
         "SELECT foreign_lang, COUNT(*) FROM parallels GROUP BY foreign_lang ORDER BY foreign_lang",
     )?;
     let by_lang = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, count(r, 1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(DatasetStats {
         version: meta_get("version")?,

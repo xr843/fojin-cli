@@ -262,13 +262,17 @@ pub fn texts_matching(
          WHERE cbeta_id IS NOT NULL AND title_zh IS NOT NULL \
          GROUP BY cbeta_id, title_zh, foreign_lang ORDER BY cbeta_id, foreign_lang",
     )?;
+    let count = |row: &rusqlite::Row<'_>, index: usize| -> rusqlite::Result<u64> {
+        let value = row.get::<_, i64>(index)?;
+        u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+    };
     let rows = stmt
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, u64>(3)?,
+                count(r, 3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
