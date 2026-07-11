@@ -187,8 +187,9 @@ Every failure before successful publish satisfies both invariants:
 
 Ordinary failures remove both owned artifacts and SQLite sidecars. If cleanup
 also fails, the cleanup error is attached as context without hiding the primary
-failure. The intentionally preserved Windows recovery case is the only
-exception, and it explicitly reports the validated candidate path.
+failure. A Windows replacement rollback failure is the only exception: it
+preserves and explicitly reports both the old-live backup and validated
+candidate so neither recoverable copy is lost.
 
 ## Testing Strategy
 

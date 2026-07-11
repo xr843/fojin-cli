@@ -6,7 +6,7 @@
 
 **Architecture:** A private `data::transfer` module streams the authenticated gzip asset to a unique sibling and then streams a `MultiGzDecoder` into a unique SQLite candidate. A private `data::operation_lock` module provides a persistent, time-bounded OS file lock used by ensure, update, and clean; `data.rs` retains SQLite validation and platform-specific atomic publication.
 
-**Tech Stack:** Rust 2021 on Rust 1.95, ureq 2.12.1, sha2 0.10, flate2 1.1.9, rusqlite 0.40.1, standard-library `File::try_lock`, local `TcpListener` fixtures, GitHub Actions.
+**Tech Stack:** Rust 2021 on Rust 1.95, ureq 3.3.0, sha2 0.10, flate2 1.1.9, rusqlite 0.40.1, standard-library `File::try_lock`, local `TcpListener` fixtures, GitHub Actions.
 
 ## Global Constraints
 
