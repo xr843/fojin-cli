@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 version_check="$repo_root/scripts/check-release-version.sh"
 archive_check="$repo_root/scripts/check-release-archive.sh"
+availability_check="$repo_root/scripts/check-release-availability.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -34,6 +35,54 @@ expect_fail "mismatched release tag" "$version_check" v1.2.4 1.2.3
 expect_fail "missing v prefix" "$version_check" 1.2.3 1.2.3
 expect_fail "prerelease tag" "$version_check" v1.2.3-rc.1 1.2.3-rc.1
 expect_fail "non-numeric tag" "$version_check" v1.2.x 1.2.x
+
+mkdir "$tmp/fake-bin"
+cat >"$tmp/fake-bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+expected=(api --paginate --slurp "repos/acme/fojin/releases?per_page=100")
+actual=("$@")
+if [[ $# -ne ${#expected[@]} ]]; then
+  printf 'unexpected gh argument count: %s\n' "$#" >&2
+  exit 64
+fi
+for index in "${!expected[@]}"; do
+  if [[ "${actual[$index]}" != "${expected[$index]}" ]]; then
+    printf 'unexpected gh argument %s: %s\n' "$index" "${actual[$index]}" >&2
+    exit 64
+  fi
+done
+if [[ "${FAKE_GH_FAIL:-0}" == 1 ]]; then
+  printf 'simulated gh API failure\n' >&2
+  exit 42
+fi
+printf '%s\n' "${FAKE_GH_RESPONSE-[]}"
+SH
+chmod +x "$tmp/fake-bin/gh"
+fake_path="$tmp/fake-bin:$PATH"
+
+expect_pass "release availability with no releases" env PATH="$fake_path" GH_TOKEN=test-token \
+  FAKE_GH_RESPONSE='[]' "$availability_check" acme/fojin v0.3.0
+expect_pass "release availability with a different tag" env PATH="$fake_path" GH_TOKEN=test-token \
+  FAKE_GH_RESPONSE='[[{"tag_name":"v0.2.0","draft":false,"assets":[]}]]' \
+  "$availability_check" acme/fojin v0.3.0
+expect_fail "existing published release" env PATH="$fake_path" GH_TOKEN=test-token \
+  FAKE_GH_RESPONSE='[[{"tag_name":"v0.3.0","draft":false,"assets":[]}]]' \
+  "$availability_check" acme/fojin v0.3.0
+expect_fail "existing draft release" env PATH="$fake_path" GH_TOKEN=test-token \
+  FAKE_GH_RESPONSE='[[{"tag_name":"v0.3.0","draft":true,"assets":[]}]]' \
+  "$availability_check" acme/fojin v0.3.0
+expect_fail "existing empty release" env PATH="$fake_path" GH_TOKEN=test-token \
+  FAKE_GH_RESPONSE='[[{"tag_name":"v0.3.0","assets":[]}]]' \
+  "$availability_check" acme/fojin v0.3.0
+expect_fail "existing release with assets" env PATH="$fake_path" GH_TOKEN=test-token \
+  FAKE_GH_RESPONSE='[[{"tag_name":"v0.3.0","assets":[{"name":"fojin.tar.gz"}]}]]' \
+  "$availability_check" acme/fojin v0.3.0
+expect_fail "gh API failure" env PATH="$fake_path" GH_TOKEN=test-token FAKE_GH_FAIL=1 \
+  "$availability_check" acme/fojin v0.3.0
+expect_fail "malformed release JSON" env PATH="$fake_path" GH_TOKEN=test-token \
+  FAKE_GH_RESPONSE='not-json' "$availability_check" acme/fojin v0.3.0
 
 target="x86_64-unknown-linux-gnu"
 version="1.2.3"
@@ -145,6 +194,22 @@ if refuses_overwrite(workflow.replace(setting, "", 1)):
     raise SystemExit("missing overwrite_files setting was accepted")
 if refuses_overwrite(workflow.replace("overwrite_files: false", "overwrite_files: true", 1)):
     raise SystemExit("overwrite_files: true was accepted")
+
+concurrency = "concurrency:\n  group: release-${{ github.ref }}\n  cancel-in-progress: false\n"
+if concurrency not in workflow:
+    raise SystemExit("release workflow must serialize runs per ref without cancellation")
+guard_index = workflow.find('run: verification-tools/check-release-availability.sh "$REPOSITORY" "$REF_NAME"')
+publish_index = workflow.find("uses: softprops/action-gh-release@")
+if guard_index < 0 or publish_index < 0 or guard_index >= publish_index:
+    raise SystemExit("release availability guard must run before softprops publication")
+for required in (
+    "GH_TOKEN: ${{ github.token }}",
+    "REPOSITORY: ${{ github.repository }}",
+    "REF_NAME: ${{ github.ref_name }}",
+    "scripts/check-release-availability.sh",
+):
+    if required not in workflow:
+        raise SystemExit(f"release availability workflow wiring missing: {required}")
 PY
 
 printf 'release script checks passed\n'

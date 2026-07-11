@@ -10,6 +10,10 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -38,11 +42,13 @@ jobs:
             scripts/check-release-version.sh "$REF_NAME" "$version"
           fi
           printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
-      - name: Upload archive verifier
+      - name: Upload release verifiers
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: verification-tools
-          path: scripts/check-release-archive.sh
+          path: |
+            scripts/check-release-archive.sh
+            scripts/check-release-availability.sh
           if-no-files-found: error
           retention-days: 1
 
@@ -195,9 +201,24 @@ jobs:
         with:
           name: release-assets
           path: dist
+      - name: Download release verifiers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verification-tools
+          path: verification-tools
       - name: Recheck release checksums
         shell: bash
         run: cd dist && sha256sum -c SHA256SUMS
+      - name: Make release availability verifier executable
+        shell: bash
+        run: chmod +x verification-tools/check-release-availability.sh
+      - name: Reject an existing release for this tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: verification-tools/check-release-availability.sh "$REPOSITORY" "$REF_NAME"
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
