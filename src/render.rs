@@ -1,5 +1,5 @@
 use crate::model::MatchGroup;
-use crate::search::SearchOutcome;
+use crate::search::{SearchOutcome, SCHEMA_VERSION};
 
 pub const FOOTER: &str = "完整上下文见 https://fojin.app  ·  数据 CC BY-SA(Dharmamitra + fojin)";
 
@@ -25,10 +25,9 @@ fn conf_tag(c: Option<f64>) -> String {
     c.map(|v| format!("  [MITRA {v:.2}]")).unwrap_or_default()
 }
 
-pub fn render_human(groups: &[MatchGroup], langs: Option<&[String]>, hidden: usize) -> String {
-    if groups.is_empty() {
-        return "未找到对齐\n".to_string();
-    }
+/// Renders groups only — no footer, no "还有 N 组" line. Shared by the plain
+/// and the split renderers.
+fn render_groups(groups: &[MatchGroup], langs: Option<&[String]>) -> String {
     let display: Vec<String> = match langs {
         Some(filter) if !filter.is_empty() => filter.to_vec(),
         _ => DISPLAY_LANGS.iter().map(|s| s.to_string()).collect(),
@@ -73,6 +72,14 @@ pub fn render_human(groups: &[MatchGroup], langs: Option<&[String]>, hidden: usi
             }
         }
     }
+    out
+}
+
+pub fn render_human(groups: &[MatchGroup], langs: Option<&[String]>, hidden: usize) -> String {
+    if groups.is_empty() {
+        return "未找到对齐\n".to_string();
+    }
+    let mut out = render_groups(groups, langs);
     if hidden > 0 {
         out.push_str(&format!("\n… 还有 {hidden} 组匹配,加 --all 查看全部\n"));
     }
@@ -80,13 +87,77 @@ pub fn render_human(groups: &[MatchGroup], langs: Option<&[String]>, hidden: usi
     out
 }
 
+fn render_fallback_hint(fallback: &crate::search::FallbackInfo) -> String {
+    format!(
+        "其中「{}」({} 字) 有对齐,可单独查询\n",
+        fallback.matched_substring, fallback.char_len
+    )
+}
+
 pub fn render_outcome_human(outcome: &SearchOutcome, langs: Option<&[String]>) -> String {
-    let hidden = outcome.total - outcome.groups.len();
-    render_human(&outcome.groups, langs, hidden)
+    let Some(segments) = &outcome.segments else {
+        if let Some(fallback) = &outcome.fallback {
+            let mut out = String::from("未找到对齐;");
+            out.push_str(&render_fallback_hint(fallback));
+            out.push_str(&format!("\n{FOOTER}\n"));
+            return out;
+        }
+        let hidden = outcome.total - outcome.groups.len();
+        return render_human(&outcome.groups, langs, hidden);
+    };
+
+    let mut out = String::from("整串未找到对齐,已按句切分查询(加 --no-split 关闭):\n");
+    for segment in segments {
+        out.push_str(&format!("\n【{}】", segment.text));
+        if segment.matched {
+            let hidden = segment.total - segment.groups.len();
+            let suffix = if hidden > 0 {
+                format!("{} 组(另有 {hidden} 组,加 --all 查看)\n", segment.total)
+            } else {
+                format!("{} 组\n", segment.total)
+            };
+            out.push_str(&suffix);
+            out.push_str(&render_groups(&segment.groups, langs));
+        } else {
+            out.push_str("未找到对齐");
+            match &segment.fallback {
+                Some(fallback) => {
+                    out.push(';');
+                    out.push_str(&render_fallback_hint(fallback));
+                }
+                None => out.push('\n'),
+            }
+        }
+    }
+    if outcome.truncated_segments > 0 {
+        out.push_str(&format!(
+            "\n(超出 {} 句上限,还有 {} 句未处理)\n",
+            crate::search::split::MAX_SEGMENTS,
+            outcome.truncated_segments
+        ));
+    }
+    out.push_str(&format!("\n{FOOTER}\n"));
+    out
 }
 
 pub fn render_outcome_json(outcome: &SearchOutcome) -> String {
-    render_json(&outcome.groups, outcome.total)
+    let mut v = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "matched": outcome.total > 0,
+        "total": outcome.total,
+        "shown": outcome.groups.len(),
+        "groups": outcome.groups,
+    });
+    if let Some(segments) = &outcome.segments {
+        v["segments"] = serde_json::json!(segments);
+    }
+    if let Some(fallback) = &outcome.fallback {
+        v["fallback"] = serde_json::json!(fallback);
+    }
+    if outcome.truncated_segments > 0 {
+        v["truncated_segments"] = serde_json::json!(outcome.truncated_segments);
+    }
+    serde_json::to_string_pretty(&v).unwrap()
 }
 
 fn group_digits(n: u64) -> String {
