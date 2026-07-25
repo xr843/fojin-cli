@@ -216,13 +216,29 @@ pub fn run() -> Result<i32> {
             }
             let preflight = normalize::normalize(raw.trim(), &normalize::NormMap::new());
             normalize::validate_query_length(&preflight)?;
-            let conn = open_ensured(data_dir, offline)?;
+            if from.is_some() && no_split {
+                eprintln!("--from 不做切分,不能与 --no-split 同用");
+                return Ok(2);
+            }
+            if let Some(code) = from.as_deref() {
+                if let Err(e) = crate::lang::validate_langs(&[code.to_string()]) {
+                    eprintln!("{e}");
+                    return Ok(2);
+                }
+            }
             let langs: Option<Vec<String>> = lang.map(|l| {
                 l.split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect()
             });
+            if let Some(codes) = langs.as_deref() {
+                if let Err(e) = crate::lang::validate_langs(codes) {
+                    eprintln!("{e}");
+                    return Ok(2);
+                }
+            }
+            let conn = open_ensured(data_dir, offline)?;
             let limit = if all { None } else { Some(limit_flag) };
             let out = compute_search(
                 &conn,
@@ -273,13 +289,19 @@ pub fn run() -> Result<i32> {
             data_dir,
             offline,
         } => {
-            let conn = open_ensured(data_dir, offline)?;
             let langs: Option<Vec<String>> = lang.map(|l| {
                 l.split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect()
             });
+            if let Some(codes) = langs.as_deref() {
+                if let Err(e) = crate::lang::validate_langs(codes) {
+                    eprintln!("{e}");
+                    return Ok(2);
+                }
+            }
+            let conn = open_ensured(data_dir, offline)?;
             let groups_all = query::by_cbeta(&conn, cbeta_id.trim(), juan, langs.as_deref(), top)?;
             let total = groups_all.len();
             if total == 0 && !json {
