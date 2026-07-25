@@ -1,5 +1,6 @@
 use fojin_cli::model::{MatchGroup, Parallel};
-use fojin_cli::render::{render_human, render_json};
+use fojin_cli::render::{render_human, render_json, render_outcome_human, render_outcome_json};
+use fojin_cli::search::{FallbackInfo, SearchOutcome, SegmentResult};
 
 fn heart() -> MatchGroup {
     MatchGroup {
@@ -163,4 +164,111 @@ fn json_includes_total_and_shown() {
     let out = render_json(&[heart()], 40);
     assert!(out.contains("\"total\": 40"));
     assert!(out.contains("\"shown\": 1"));
+}
+
+fn outcome_with_segments() -> SearchOutcome {
+    SearchOutcome {
+        groups: vec![heart()],
+        total: 1,
+        segments: Some(vec![
+            SegmentResult {
+                text: "色即是空".into(),
+                matched: true,
+                total: 1,
+                groups: vec![heart()],
+                fallback: None,
+            },
+            SegmentResult {
+                text: "度一切苦厄".into(),
+                matched: false,
+                total: 0,
+                groups: vec![],
+                fallback: Some(FallbackInfo {
+                    matched_substring: "一切苦".into(),
+                    char_len: 3,
+                }),
+            },
+        ]),
+        fallback: None,
+        truncated_segments: 0,
+    }
+}
+
+#[test]
+fn human_split_output_labels_each_segment() {
+    let out = render_outcome_human(&outcome_with_segments(), None);
+    assert!(out.contains("已按句切分查询"), "got: {out}");
+    assert!(out.contains("--no-split"));
+    assert!(out.contains("【色即是空】"));
+    assert!(out.contains("【度一切苦厄】"));
+    assert!(out.contains("梵  rūpaṃ śūnyatā  [MITRA 0.91]"));
+}
+
+#[test]
+fn human_segment_fallback_points_at_the_matching_substring() {
+    let out = render_outcome_human(&outcome_with_segments(), None);
+    assert!(out.contains("其中「一切苦」"), "got: {out}");
+    assert!(out.contains("可单独查询"));
+}
+
+#[test]
+fn human_reports_truncated_segments_instead_of_dropping_silently() {
+    let mut outcome = outcome_with_segments();
+    outcome.truncated_segments = 4;
+    let out = render_outcome_human(&outcome, None);
+    assert!(out.contains("还有 4 句未处理"), "got: {out}");
+}
+
+#[test]
+fn human_whole_string_fallback_is_a_single_hint() {
+    let outcome = SearchOutcome {
+        groups: vec![],
+        total: 0,
+        segments: None,
+        fallback: Some(FallbackInfo {
+            matched_substring: "色不异空".into(),
+            char_len: 4,
+        }),
+        truncated_segments: 0,
+    };
+    let out = render_outcome_human(&outcome, None);
+    assert!(out.contains("未找到对齐"));
+    assert!(out.contains("其中「色不异空」(4 字) 有对齐"), "got: {out}");
+}
+
+#[test]
+fn json_keeps_the_existing_top_level_contract() {
+    let out = render_outcome_json(&outcome_with_segments());
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["matched"], serde_json::json!(true));
+    assert_eq!(v["total"], serde_json::json!(1));
+    assert_eq!(v["shown"], serde_json::json!(1));
+    assert!(v["groups"].is_array());
+    assert_eq!(v["schema_version"], serde_json::json!(1));
+}
+
+#[test]
+fn json_segments_appear_only_when_splitting_happened() {
+    let with = render_outcome_json(&outcome_with_segments());
+    let v: serde_json::Value = serde_json::from_str(&with).unwrap();
+    assert!(v["segments"].is_array());
+    assert_eq!(
+        v["segments"][1]["fallback"]["matched_substring"],
+        serde_json::json!("一切苦")
+    );
+    assert_eq!(v["segments"][1]["total"], serde_json::json!(0));
+
+    let plain = SearchOutcome {
+        groups: vec![heart()],
+        total: 1,
+        segments: None,
+        fallback: None,
+        truncated_segments: 0,
+    };
+    let v: serde_json::Value = serde_json::from_str(&render_outcome_json(&plain)).unwrap();
+    assert!(
+        v.get("segments").is_none(),
+        "no segments key on the hit path"
+    );
+    assert!(v.get("fallback").is_none());
 }
