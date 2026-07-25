@@ -1256,6 +1256,26 @@ fn merged_groups_are_deduplicated() {
 #[test]
 fn empty_segment_gets_its_own_fallback() {
     let conn = fixture();
+    // Segment 2 matches nothing whole, but 觀自在菩薩 (normalized 观自在菩萨)
+    // sits inside it and IS in the fixture — that is what fallback must find.
+    let out = run(&conn, &req("涅槃寂靜，觀自在菩薩摩訶薩", false)).unwrap();
+    let segments = out.segments.unwrap();
+    let miss = segments
+        .iter()
+        .find(|s| s.text == "觀自在菩薩摩訶薩")
+        .unwrap();
+    assert!(!miss.matched);
+    let fb = miss
+        .fallback
+        .as_ref()
+        .expect("a segment with a matching substring must carry a fallback");
+    assert_eq!(fb.matched_substring, "观自在菩萨");
+    assert_eq!(fb.char_len, 5);
+}
+
+#[test]
+fn segment_with_no_matching_substring_has_no_fallback() {
+    let conn = fixture();
     let out = run(&conn, &req("觀自在菩薩，涅槃寂靜無為", false)).unwrap();
     let segments = out.segments.unwrap();
     let miss = segments.iter().find(|s| !s.matched).unwrap();
