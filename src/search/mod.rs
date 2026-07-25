@@ -70,9 +70,20 @@ pub struct SearchRequest<'a> {
     pub no_split: bool,
 }
 
-/// Skeleton: whole-string query only. Task 3 adds the `from` branch; Task 6
-/// adds splitting and fallback.
+/// Skeleton: whole-string query only. Task 6 adds splitting and fallback.
 pub fn run(conn: &Connection, req: &SearchRequest) -> Result<SearchOutcome> {
+    if let Some(from_lang) = req.from {
+        let needle = req.raw.trim();
+        if needle.chars().count() < query::MIN_FOREIGN_QUERY_CHARS {
+            anyhow::bail!(
+                "反向查询至少需要 {} 个字符;更短的串会命中过多,无对读价值",
+                query::MIN_FOREIGN_QUERY_CHARS
+            );
+        }
+        let groups = query::search_foreign(conn, from_lang, needle, req.langs, req.top)?;
+        return Ok(SearchOutcome::plain(groups, req.limit));
+    }
+
     let map = normalize::load_norm_map(conn)?;
     let norm = normalize::normalize(req.raw.trim(), &map);
     normalize::validate_query_length(&norm)?;

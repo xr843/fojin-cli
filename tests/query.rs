@@ -1,4 +1,5 @@
 use fojin_cli::query::search;
+use fojin_cli::query::search_foreign;
 use fojin_cli::schema::init_schema;
 use rusqlite::{params, Connection};
 
@@ -475,4 +476,81 @@ fn texts_matching_no_hit_is_empty() {
     assert!(fojin_cli::query::texts_matching(&conn, "法华", &map)
         .unwrap()
         .is_empty());
+}
+
+fn bilingual_fixture() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    for (zt, zn, lang, f) in [
+        ("色即是空", "色即是空", "sa", "Rūpaṃ śūnyatā"),
+        ("色即是空", "色即是空", "bo", "gzugs stong pa"),
+        ("受想行識", "受想行识", "sa", "vedanā saṃjñā"),
+    ] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?2,?3,?4,1.0,'T0251','心經',1)",
+            params![zt, zn, lang, f],
+        )
+        .unwrap();
+    }
+    conn
+}
+
+#[test]
+fn foreign_search_finds_group_and_shows_all_langs() {
+    let conn = bilingual_fixture();
+    let g = search_foreign(&conn, "sa", "śūnyatā", None, 3).unwrap();
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].zh_text, "色即是空");
+    assert_eq!(
+        g[0].parallels.len(),
+        2,
+        "a Sanskrit hit must still surface the group's Tibetan parallel"
+    );
+}
+
+#[test]
+fn foreign_search_folds_case_and_diacritic_capitals() {
+    let conn = bilingual_fixture();
+    // stored as "Rūpaṃ śūnyatā"; the query is all-lowercase
+    let g = search_foreign(&conn, "sa", "rūpaṃ", None, 3).unwrap();
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].zh_text, "色即是空");
+}
+
+#[test]
+fn foreign_search_respects_from_lang() {
+    let conn = bilingual_fixture();
+    // "gzugs" only exists in the bo rows, so searching sa must not find it
+    let g = search_foreign(&conn, "sa", "gzugs", None, 3).unwrap();
+    assert!(g.is_empty());
+}
+
+#[test]
+fn foreign_search_display_lang_filter_applies() {
+    let conn = bilingual_fixture();
+    let langs = vec!["bo".to_string()];
+    let g = search_foreign(&conn, "sa", "śūnyatā", Some(&langs), 3).unwrap();
+    assert_eq!(g.len(), 1, "found via Sanskrit");
+    assert_eq!(g[0].parallels.len(), 1);
+    assert_eq!(
+        g[0].parallels[0].lang, "bo",
+        "--from sa --lang bo means: find by Sanskrit, display Tibetan"
+    );
+}
+
+#[test]
+fn foreign_search_no_hit_is_empty_not_error() {
+    let conn = bilingual_fixture();
+    let g = search_foreign(&conn, "sa", "nirvāṇa", None, 3).unwrap();
+    assert!(g.is_empty());
+}
+
+#[test]
+fn known_lang_absent_from_dataset_answers_empty_not_error() {
+    // `pi` is a valid code with zero rows in data-v1. It must answer honestly
+    // rather than error — the spec's "已知但本数据集无行 → 退出码 0" row.
+    let conn = bilingual_fixture();
+    let g = search_foreign(&conn, "pi", "dukkha", None, 3).unwrap();
+    assert!(g.is_empty());
 }

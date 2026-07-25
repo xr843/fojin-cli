@@ -1,7 +1,7 @@
 use crate::model::{MatchGroup, Parallel};
 use rusqlite::Connection;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 struct Row {
     zh_text: String,
@@ -24,7 +24,85 @@ pub fn search(
         return Ok(vec![]);
     }
     let rows = fetch_rows(conn, norm_query)?;
-    Ok(group_and_rank(rows, norm_query, langs, top))
+    Ok(group_and_rank(
+        rows,
+        norm_query,
+        langs,
+        top,
+        MatchColumn::ZhNorm,
+    ))
+}
+
+/// Minimum characters for a reverse query. IAST bigrams like `ka` match tens of
+/// thousands of rows and carry no parallel-reading value; this mirrors the
+/// 2-character floor on the Chinese side.
+pub const MIN_FOREIGN_QUERY_CHARS: usize = 3;
+
+/// Reverse lookup: find Chinese segments whose `from_lang` parallel contains
+/// `raw_query`. Matching happens in Rust with full Unicode case folding —
+/// SQLite's `instr` is case-sensitive and its `LOWER()` is ASCII-only, so
+/// `tasmāc` would never find the stored `Tasmāc`.
+pub fn search_foreign(
+    conn: &Connection,
+    from_lang: &str,
+    raw_query: &str,
+    langs: Option<&[String]>,
+    top: usize,
+) -> rusqlite::Result<Vec<MatchGroup>> {
+    let needle = raw_query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Pass 1: locate hit groups, scanning only the source language's rows.
+    let mut stmt = conn.prepare(
+        "SELECT zh_text, cbeta_id, juan_num, foreign_text \
+         FROM parallels WHERE foreign_lang = ?1",
+    )?;
+    let mut hits: HashSet<(String, Option<String>, Option<i64>)> = HashSet::new();
+    let mut rows = stmt.query([from_lang])?;
+    while let Some(row) = rows.next()? {
+        let foreign_text: String = row.get(3)?;
+        if !foreign_text.to_lowercase().contains(&needle) {
+            continue;
+        }
+        hits.insert((row.get(0)?, row.get(1)?, row.get(2)?));
+    }
+    if hits.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Pass 2: pull every language's rows for the hit groups.
+    let mut stmt = conn.prepare(
+        "SELECT zh_text,zh_norm,foreign_lang,foreign_text,confidence,\
+                cbeta_id,title_zh,juan_num FROM parallels",
+    )?;
+    let mut collected: Vec<Row> = Vec::new();
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let row = Row {
+            zh_text: r.get(0)?,
+            zh_norm: r.get(1)?,
+            foreign_lang: r.get(2)?,
+            foreign_text: r.get(3)?,
+            confidence: r.get(4)?,
+            cbeta_id: r.get(5)?,
+            title_zh: r.get(6)?,
+            juan_num: r.get(7)?,
+        };
+        let key = (row.zh_text.clone(), row.cbeta_id.clone(), row.juan_num);
+        if hits.contains(&key) {
+            collected.push(row);
+        }
+    }
+
+    Ok(group_and_rank(
+        collected,
+        &needle,
+        langs,
+        top,
+        MatchColumn::ForeignText,
+    ))
 }
 
 fn fts_quote(q: &str) -> String {
@@ -71,6 +149,13 @@ struct GroupKey {
     juan_num: Option<i64>,
 }
 
+/// Which column the query string is measured against when ranking groups.
+#[derive(Clone, Copy)]
+enum MatchColumn {
+    ZhNorm,
+    ForeignText,
+}
+
 struct Acc {
     zh_text: String,
     cbeta_id: Option<String>,
@@ -84,25 +169,30 @@ struct Acc {
 
 fn group_and_rank(
     rows: Vec<Row>,
-    norm_query: &str,
+    needle: &str,
     langs: Option<&[String]>,
     top: usize,
+    column: MatchColumn,
 ) -> Vec<MatchGroup> {
     let mut accs: Vec<Acc> = Vec::new();
     let mut acc_idx: HashMap<GroupKey, usize> = HashMap::new();
-    let query_chars = norm_query.chars().count();
+    let query_chars = needle.chars().count();
     for row in rows {
         if let Some(filter) = langs {
             if !filter.iter().any(|l| l == &row.foreign_lang) {
                 continue;
             }
         }
-        let contains = row.zh_norm.contains(norm_query);
-        let exact = row.zh_norm == norm_query;
+        let hay = match column {
+            MatchColumn::ZhNorm => row.zh_norm.clone(),
+            MatchColumn::ForeignText => row.foreign_text.to_lowercase(),
+        };
+        let contains = hay.contains(needle);
+        let exact = hay == needle;
         let excess_chars = if contains {
-            row.zh_norm.chars().count().saturating_sub(query_chars)
+            hay.chars().count().saturating_sub(query_chars)
         } else {
-            row.zh_norm.chars().count()
+            hay.chars().count()
         };
         let key = GroupKey {
             zh_text: row.zh_text.clone(),

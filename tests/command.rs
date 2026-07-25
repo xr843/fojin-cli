@@ -405,3 +405,20 @@ fn from_with_no_split_is_a_usage_error() {
         .unwrap()
         .contains("--from 不做切分"));
 }
+
+#[test]
+fn short_reverse_query_is_a_runtime_error() {
+    let dir = tempfile::tempdir().unwrap();
+    write_offline_db(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["parallel", "ka", "--from", "sa", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("至少需要 3 个字符"));
+}
