@@ -68,3 +68,18 @@ fn propagates_probe_error() {
     let probe = |_: &str| Err(anyhow::anyhow!("db exploded"));
     assert!(longest_matching("色即是空", probe).is_err());
 }
+
+#[test]
+fn accepts_three_char_query_at_lower_bound() {
+    let probe = |_: &str| Ok(true);
+    let fb = longest_matching("色空義", probe).unwrap().unwrap();
+    assert_eq!(fb.char_len, 2);
+}
+
+#[test]
+fn accepts_sixty_char_query_at_upper_bound() {
+    let long = "空".repeat(60);
+    let probe = |_: &str| Ok(true);
+    let fb = longest_matching(&long, probe).unwrap().unwrap();
+    assert_eq!(fb.char_len, 59);
+}
