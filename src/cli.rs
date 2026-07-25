@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use std::io::Read;
 use std::path::PathBuf;
 
-use crate::{data, normalize, query, render, search};
+use crate::{data, lang, normalize, query, render, search};
 
 /// Release process sets DATA_SHA256 to the published artifact's checksum.
 pub const DATA_URL: &str =
@@ -232,11 +232,8 @@ pub fn run() -> Result<i32> {
                     .filter(|s| !s.is_empty())
                     .collect()
             });
-            if let Some(codes) = langs.as_deref() {
-                if let Err(e) = crate::lang::validate_langs(codes) {
-                    eprintln!("{e}");
-                    return Ok(2);
-                }
+            if let Some(code) = validate_langs_arg(langs.as_deref()) {
+                return Ok(code);
             }
             let conn = open_ensured(data_dir, offline)?;
             let limit = if all { None } else { Some(limit_flag) };
@@ -295,11 +292,8 @@ pub fn run() -> Result<i32> {
                     .filter(|s| !s.is_empty())
                     .collect()
             });
-            if let Some(codes) = langs.as_deref() {
-                if let Err(e) = crate::lang::validate_langs(codes) {
-                    eprintln!("{e}");
-                    return Ok(2);
-                }
+            if let Some(code) = validate_langs_arg(langs.as_deref()) {
+                return Ok(code);
             }
             let conn = open_ensured(data_dir, offline)?;
             let groups_all = query::by_cbeta(&conn, cbeta_id.trim(), juan, langs.as_deref(), top)?;
@@ -324,6 +318,19 @@ pub fn run() -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// 校验 `--lang` 语种代码列表;未传则视为通过。
+///
+/// 非法代码时打印错误到 stderr 并返回应提前退出的状态码,调用方需
+/// `return Ok(code)`。
+fn validate_langs_arg(langs: Option<&[String]>) -> Option<i32> {
+    let codes = langs?;
+    if let Err(e) = lang::validate_langs(codes) {
+        eprintln!("{e}");
+        return Some(2);
+    }
+    None
 }
 
 /// Resolve the data path, ensure the dataset is present (downloading unless
