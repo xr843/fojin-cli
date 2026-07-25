@@ -5,7 +5,7 @@
 [![release](https://img.shields.io/github/v/release/xr843/fojin-cli?filter=v*&label=release)](https://github.com/xr843/fojin-cli/releases/latest)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可)
 
-**离线 · 无需登录 · 单二进制。** 给一段汉文,查它在梵/藏正典中的平行文本。本地查询毫秒级(实测典型 2 ms,数千组命中的高频词约 0.3 s)。
+**离线 · 无需登录 · 单二进制。** 给一段汉文,查它在梵/藏正典中的平行文本。命中时本地查询毫秒级(实测典型 2 ms,数千组命中的高频词约 0.3 s);零命中并触发切分与回退时更慢,实测单串约 13 ms、20 句的长输入约 0.33 s。
 
 *English readers: see the [English summary](#english-summary) at the bottom.*
 
@@ -106,14 +106,17 @@ fojin parallel "色即是空" --json
 {
   "groups": [
     {
-      "cbeta_id": "T0237",
-      "juan_num": 1,
+      "cbeta_id": "T0310",
+      "juan_num": 2,
       "parallels": [
-        { "confidence": 1.0, "lang": "sa", "text": "tasmāt tarhi subhūte bodhisatvena evaṃ cittam utpādayitavyaṃ apratiṣṭhitaṃ …" },
-        { "confidence": 1.0, "lang": "bo", "text": "བྱང་ཆུབ་སེམས་དཔའ་སེམས་དཔའ་ཆེན་པོས་འདི་ལྟར་མི་གནས་པར་སེམས་བསྐྱེད་པར་བྱའོ་༎ …" }
+        {
+          "confidence": 1.0,
+          "lang": "bo",
+          "text": "ཁྱེད་མཚན་མའི་འདུ་ཤེས་མ་བྱེད་ཅིག་།"
+        }
       ],
-      "title_zh": "金剛般若波羅蜜經",
-      "zh_text": "是故菩薩應生如是無住著心，不住色、聲、香、味、觸、法生心，應無所住而生其心。"
+      "title_zh": "大寶積經",
+      "zh_text": "勿於處所生住著心，應無所住。"
     }
   ],
   "matched": true,
@@ -123,7 +126,8 @@ fojin parallel "色即是空" --json
 }
 ```
 
-(示例取自真实查询 `fojin parallel "应无所住" --json --top 1 --limit 1`,文本有截断;字段实际按字母序输出。)
+(以上是 `fojin parallel "应无所住" --json --top 1 --limit 1` 的完整真实输出,未作删改;
+`--top 1` 只保留每语一条,`--limit 1` 只保留 10 组匹配中的第一组,字段按字母序输出。)
 
 ## 其他子命令
 
@@ -168,7 +172,8 @@ fojin parallel "<汉文短语>" --json --offline
 - 查询须至少 **2 个汉字**;单字查询会被拒绝(范围过大,无对读价值)。
 - **简繁通用、标点无关**:查询前自动做简繁归一并剥离标点——简体「应无所住」可直接命中繁体原文「應無所住而生其心」。
 - 匹配为**整串子串匹配**(FTS5 trigram):查询串须连续完整出现在某条经文分段中。4~12 字的短语/名句命中最佳。
-- **整串查不到时会自动按句切分重查**(加 `--no-split` 关闭;最多处理 20 句,超出部分会在输出中明确告知),并对仍无命中的分句给出该句中最长的可命中子串(归一化后超过 60 字则不回退;子串为归一化形式——简体、已去标点,可能与原字形不同)。
+- **整串查不到时会自动按句切分重查**(加 `--no-split` 关闭;最多处理 20 句,超出部分会在输出中明确告知),并对仍无命中的分句给出该句中最长的可命中子串(子串至少 3 字——更短的子串在 90 万行语料里几乎必然命中,提示没有信息量;查询归一化后超过 60 字则不回退;子串为归一化形式——简体、已去标点,可能与原字形不同)。
+- 切句只按**句级**标点(`，。；：！？` 及对应半角、换行);顿号 `、` 不算——佛典列举(色聲香味觸法)本身就是一条对齐分段,在那里断会把它切碎。
 - 输入端不再限于汉文:`--from sa` / `--from bo` 可用梵文转写或藏文反查汉文对应(完整 Unicode 大小写折叠;变音符号仍需与原文一致,不做折叠),反查不做切分与回退。
 
 ## 退出码
@@ -213,7 +218,7 @@ fojin parallel "<汉文短语>" --json --offline
 
 ## English Summary
 
-**fojin-cli** is an offline command-line tool: give it a Chinese Buddhist canonical passage, it returns the aligned Sanskrit/Tibetan parallels — from a local SQLite, in ~2 ms, fully offline after a one-time 183 MB data download. Single binary, no account, deterministic output.
+**fojin-cli** is an offline command-line tool: give it a Chinese Buddhist canonical passage, it returns the aligned Sanskrit/Tibetan parallels — from a local SQLite, in ~2 ms on a hit (a zero-hit query that falls through to sentence splitting and substring fallback costs more — up to ~0.33 s measured), fully offline after a one-time 183 MB data download. Single binary, no account, deterministic output.
 
 ```bash
 cargo install fojin-cli --locked # or: curl -fsSL https://raw.githubusercontent.com/xr843/fojin-cli/master/install.sh | sh

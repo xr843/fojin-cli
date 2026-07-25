@@ -1,3 +1,4 @@
+use fojin_cli::query::exists;
 use fojin_cli::query::search;
 use fojin_cli::query::search_foreign;
 use fojin_cli::schema::init_schema;
@@ -79,6 +80,78 @@ fn short_query_uses_substring_fallback() {
     let g = search(&conn, "色即", None, 3).unwrap(); // 2 chars < 3
     assert_eq!(g.len(), 1);
     assert_eq!(g[0].zh_text, "色即是空");
+}
+
+#[test]
+fn exists_agrees_with_search_emptiness() {
+    let conn = fixture();
+    // Above and below the FTS floor, hitting and missing: the cheap existence
+    // check must never disagree with the full search it replaces.
+    for q in ["色即是空", "色即", "涅槃寂静", "涅槃", ""] {
+        assert_eq!(
+            exists(&conn, q, None).unwrap(),
+            !search(&conn, q, None, 3).unwrap().is_empty(),
+            "disagreement on {q:?}"
+        );
+    }
+}
+
+#[test]
+fn exists_applies_the_lang_filter() {
+    let conn = fixture();
+    // 受想行識 is aligned in `sa` only; 色即是空 in both. A caller that asked
+    // for `bo` cannot be shown the former, so it does not exist *for them* —
+    // this is what keeps the fallback from suggesting invisible substrings.
+    let sa = vec!["sa".to_string()];
+    let bo = vec!["bo".to_string()];
+    assert!(exists(&conn, "受想行识", Some(&sa)).unwrap());
+    assert!(!exists(&conn, "受想行识", Some(&bo)).unwrap());
+    assert!(exists(&conn, "色即是空", Some(&bo)).unwrap());
+    // Same verdicts as the full search, filter included.
+    for (q, langs) in [("受想行识", &sa), ("受想行识", &bo), ("色即是空", &bo)] {
+        assert_eq!(
+            exists(&conn, q, Some(langs)).unwrap(),
+            !search(&conn, q, Some(langs), 3).unwrap().is_empty(),
+            "disagreement on {q:?} with {langs:?}"
+        );
+    }
+}
+
+#[test]
+fn exists_applies_the_lang_filter_below_the_fts_floor() {
+    let conn = fixture();
+    // The `instr` branch must filter identically to the FTS branch.
+    let bo = vec!["bo".to_string()];
+    assert!(!exists(&conn, "受想", Some(&bo)).unwrap());
+    assert!(exists(&conn, "色即", Some(&bo)).unwrap());
+}
+
+#[test]
+fn exists_with_an_empty_lang_list_matches_nothing() {
+    let conn = fixture();
+    // `search` filters every row out when the list is empty; `exists` agrees
+    // instead of emitting `IN ()`.
+    let none: Vec<String> = Vec::new();
+    assert!(!exists(&conn, "色即是空", Some(&none)).unwrap());
+    assert!(search(&conn, "色即是空", Some(&none), 3)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn exists_treats_quotes_in_the_needle_literally() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+         VALUES ('quoted','經\"甲\"文','sa','x',1.0,'T0001','測試',1)",
+        [],
+    )
+    .unwrap();
+    // A bare `"` inside an FTS5 phrase would end the phrase and change the
+    // query; `fts_quote` doubles it, exactly as `search` does.
+    assert!(exists(&conn, "經\"甲\"文", None).unwrap());
+    assert!(!exists(&conn, "經\"乙\"文", None).unwrap());
 }
 
 #[test]

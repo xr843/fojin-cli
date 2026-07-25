@@ -49,6 +49,25 @@ fn does_not_split_on_in_sentence_marks() {
 }
 
 #[test]
+fn does_not_split_on_the_enumeration_comma() {
+    // 、 joins the items of one enumeration, it does not end a sentence.
+    // Canonical lists are stored as a single aligned segment, so splitting
+    // here both destroys the phrase that would have matched and silently
+    // drops every single-character item via the length predicate.
+    let out = split_sentences("不住色、聲、香、味、觸、法而生其心", keep_two_chars);
+    assert_eq!(out.segments, vec!["不住色、聲、香、味、觸、法而生其心"]);
+    assert_eq!(out.truncated, 0);
+}
+
+#[test]
+fn still_splits_on_colons() {
+    // Unlike 、, a colon introduces a following clause instead of joining one,
+    // so it behaves like 。 and stays in the split set.
+    let out = split_sentences("佛告須菩提：諸菩薩摩訶薩:應如是住", keep_two_chars);
+    assert_eq!(out.segments, vec!["佛告須菩提", "諸菩薩摩訶薩", "應如是住"]);
+}
+
+#[test]
 fn splits_on_newlines_and_ascii_punctuation() {
     let out = split_sentences("色即是空\n受想行識,無眼耳鼻舌身意", keep_two_chars);
     assert_eq!(out.segments, vec!["色即是空", "受想行識", "無眼耳鼻舌身意"]);

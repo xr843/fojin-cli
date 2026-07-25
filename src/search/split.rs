@@ -2,10 +2,15 @@
 /// silently dropped.
 pub const MAX_SEGMENTS: usize = 20;
 
-/// Sentence-level punctuation only. Book-title brackets, quotes, parentheses
-/// and the interpunct are deliberately absent: they occur mid-sentence, and
-/// breaking there would cut phrases in half.
-pub const SPLIT_CHARS: &str = "，。；：！？、,.;:!?\n\r";
+/// Sentence-level punctuation only. Book-title brackets, quotes, parentheses,
+/// the interpunct and the enumeration comma `、` are deliberately absent: they
+/// occur mid-sentence, and breaking there would cut phrases in half. `、` is
+/// the sharpest case — canonical enumerations (色聲香味觸法、眼耳鼻舌身意) are
+/// stored as one aligned segment and only match unsplit, and their
+/// single-character items would be dropped by the caller's length predicate.
+/// `：`/`:` stay: they introduce a new clause rather than joining one, so
+/// breaking there behaves like `。`.
+pub const SPLIT_CHARS: &str = "，。；：！？,.;:!?\n\r";
 
 pub struct SplitOutcome {
     pub segments: Vec<String>,

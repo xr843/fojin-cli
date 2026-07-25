@@ -362,6 +362,65 @@ fn unknown_from_lang_is_a_usage_error_before_touching_data() {
 }
 
 #[test]
+fn unknown_from_lang_outranks_the_query_length_preflight() {
+    // A one-character query also fails the length pre-flight, which exits 1
+    // with advice about 汉字 — nonsense for a reverse query and the wrong exit
+    // code for a bad flag. Usage errors must be reported first.
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["parallel", "ś", "--from", "sk", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("未知语种 `sk`"), "got: {stderr}");
+    assert!(
+        !stderr.contains("至少需要 2 个汉字"),
+        "the length pre-flight must not preempt the usage error: {stderr}"
+    );
+}
+
+#[test]
+fn unknown_display_lang_outranks_the_query_length_preflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["parallel", "色", "--lang", "sk", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("未知语种 `sk`"), "got: {stderr}");
+    assert!(
+        !stderr.contains("至少需要 2 个汉字"),
+        "the length pre-flight must not preempt the usage error: {stderr}"
+    );
+}
+
+#[test]
+fn single_char_query_is_still_a_runtime_error_when_flags_are_valid() {
+    // The reorder must not weaken the pre-flight itself: with nothing else
+    // wrong, a one-character query still fails before any data is opened.
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["parallel", "色", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("至少需要 2 个汉字"), "got: {stderr}");
+    assert!(
+        !stderr.contains("本地数据不存在"),
+        "the pre-flight must still precede data access: {stderr}"
+    );
+}
+
+#[test]
 fn unknown_display_lang_is_a_usage_error() {
     let dir = tempfile::tempdir().unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))

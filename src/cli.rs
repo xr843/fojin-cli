@@ -214,8 +214,6 @@ pub fn run() -> Result<i32> {
                 eprintln!("用法: fojin parallel \"色即是空\"  (或管道: echo ... | fojin parallel)");
                 return Ok(2);
             }
-            let preflight = normalize::normalize(raw.trim(), &normalize::NormMap::new());
-            normalize::validate_query_length(&preflight)?;
             if from.is_some() && no_split {
                 eprintln!("--from 不做切分,不能与 --no-split 同用");
                 return Ok(2);
@@ -235,6 +233,12 @@ pub fn run() -> Result<i32> {
             if let Some(code) = validate_langs_arg(langs.as_deref()) {
                 return Ok(code);
             }
+            // Usage errors (exit 2) outrank this runtime pre-flight (exit 1):
+            // a query too short to be useful is still a *query* problem, and
+            // reporting it first would mask an unknown `--from`/`--lang` code
+            // behind both the wrong exit code and irrelevant advice.
+            let preflight = normalize::normalize(raw.trim(), &normalize::NormMap::new());
+            normalize::validate_query_length(&preflight)?;
             let conn = open_ensured(data_dir, offline)?;
             let limit = if all { None } else { Some(limit_flag) };
             let out = compute_search(

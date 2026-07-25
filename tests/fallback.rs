@@ -1,4 +1,5 @@
-use fojin_cli::search::fallback::longest_matching;
+use fojin_cli::query::FTS_MIN_CHARS;
+use fojin_cli::search::fallback::{longest_matching, MIN_FALLBACK_CHARS};
 
 #[test]
 fn finds_longest_present_substring() {
@@ -19,10 +20,12 @@ fn returns_none_when_nothing_matches() {
 
 #[test]
 fn prefers_earliest_start_among_equal_lengths() {
-    let probe = |c: &str| Ok(c == "甲乙" || c == "丙丁");
-    let fb = longest_matching("甲乙丙丁", probe).unwrap().unwrap();
-    assert_eq!(fb.matched_substring, "甲乙");
-    assert_eq!(fb.char_len, 2);
+    // Two candidates of the same (minimum) length match; the earlier start
+    // must win.
+    let probe = |c: &str| Ok(c == "甲乙丙" || c == "丙丁戊");
+    let fb = longest_matching("甲乙丙丁戊", probe).unwrap().unwrap();
+    assert_eq!(fb.matched_substring, "甲乙丙");
+    assert_eq!(fb.char_len, 3);
 }
 
 #[test]
@@ -35,9 +38,13 @@ fn never_returns_the_whole_query() {
 }
 
 #[test]
-fn declines_queries_shorter_than_three_chars() {
+fn declines_queries_too_short_to_hold_a_proper_substring() {
+    // A candidate must be a *proper* substring of at least MIN_FALLBACK_CHARS
+    // characters, so a query needs MIN_FALLBACK_CHARS + 1 characters before
+    // anything is probeable. Both 2 and 3 characters are below that.
     let probe = |_: &str| Ok(true);
     assert!(longest_matching("色空", probe).unwrap().is_none());
+    assert!(longest_matching("色空義", probe).unwrap().is_none());
 }
 
 #[test]
@@ -70,10 +77,31 @@ fn propagates_probe_error() {
 }
 
 #[test]
-fn accepts_three_char_query_at_lower_bound() {
+fn accepts_four_char_query_at_lower_bound() {
     let probe = |_: &str| Ok(true);
-    let fb = longest_matching("色空義", probe).unwrap().unwrap();
-    assert_eq!(fb.char_len, 2);
+    let fb = longest_matching("色空義理", probe).unwrap().unwrap();
+    assert_eq!(fb.char_len, 3);
+}
+
+#[test]
+fn never_probes_a_candidate_below_the_fts_floor() {
+    // The whole point of the MIN_FALLBACK_CHARS floor: a shorter candidate
+    // would leave the trigram index and scan all ~900k rows, once per start,
+    // once per segment. Watch every candidate the search actually issues.
+    use std::cell::Cell;
+    let shortest = Cell::new(usize::MAX);
+    let probe = |c: &str| {
+        shortest.set(shortest.get().min(c.chars().count()));
+        Ok(false)
+    };
+    let _ = longest_matching(&"空".repeat(40), probe).unwrap();
+    assert!(
+        shortest.get() >= FTS_MIN_CHARS,
+        "probed a {}-char candidate, below the FTS floor of {FTS_MIN_CHARS}",
+        shortest.get()
+    );
+    // …and refuse to compile if a future edit lowers the floor itself.
+    const { assert!(MIN_FALLBACK_CHARS >= FTS_MIN_CHARS) };
 }
 
 #[test]

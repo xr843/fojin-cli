@@ -99,8 +99,11 @@ pub fn run(conn: &Connection, req: &SearchRequest) -> Result<SearchOutcome> {
         return Ok(SearchOutcome::plain(groups, req.limit));
     }
 
+    // Existence only: `query::exists` stops at the first displayable row, and
+    // applies the same `--lang` filter `query::search` would, so a substring is
+    // only suggested when this very invocation could show it.
     let probe = |candidate: &str| -> Result<bool> {
-        Ok(!query::search(conn, candidate, req.langs, 1)?.is_empty())
+        query::exists(conn, candidate, req.langs).map_err(Into::into)
     };
 
     if !req.no_split {

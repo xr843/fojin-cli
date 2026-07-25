@@ -33,6 +33,64 @@ pub fn search(
     ))
 }
 
+/// Shortest needle the FTS5 trigram index can serve. Below it, matching falls
+/// back to `instr()` over the whole `parallels` table — ~900k rows, no index —
+/// so any hot path that probes repeatedly must stay at or above this floor.
+pub const FTS_MIN_CHARS: usize = 3;
+
+/// Existence check behind the zero-hit fallback probe: would `search` return
+/// anything at all for `norm_query`? Answers with `SELECT 1 … LIMIT 1` instead
+/// of materializing every matching row and then grouping and ranking it, which
+/// is all wasted work when the caller only wants a yes/no.
+///
+/// The `--lang` filter is applied here for the same reason `group_and_rank`
+/// applies it: a segment whose parallels are all excluded by `--lang` is not a
+/// hit for that invocation. Without the filter the fallback would point the
+/// reader at a substring the very same command refuses to display.
+///
+/// Mirrors `fetch_rows`' index choice, so `exists` and `!search(…).is_empty()`
+/// agree at every length. The fallback only ever calls it with at least
+/// `FTS_MIN_CHARS` characters, which keeps every probe off the `instr` scan.
+pub fn exists(
+    conn: &Connection,
+    norm_query: &str,
+    langs: Option<&[String]>,
+) -> rusqlite::Result<bool> {
+    if norm_query.is_empty() {
+        return Ok(false);
+    }
+    // `group_and_rank` keeps a row only if its language is listed, so an empty
+    // list keeps nothing. Short-circuit rather than emit `IN ()`.
+    if langs.is_some_and(|codes| codes.is_empty()) {
+        return Ok(false);
+    }
+    let (source, param) = if norm_query.chars().count() >= FTS_MIN_CHARS {
+        (
+            "parallels_fts f JOIN parallels p ON p.id=f.rowid \
+             WHERE parallels_fts MATCH ?1",
+            fts_quote(norm_query),
+        )
+    } else {
+        (
+            "parallels p WHERE instr(p.zh_norm, ?1) > 0",
+            norm_query.to_owned(),
+        )
+    };
+    let mut sql = format!("SELECT 1 FROM {source}");
+    let mut params: Vec<String> = vec![param];
+    if let Some(codes) = langs {
+        let placeholders = (0..codes.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" AND p.foreign_lang IN ({placeholders})"));
+        params.extend(codes.iter().cloned());
+    }
+    sql.push_str(" LIMIT 1");
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.exists(rusqlite::params_from_iter(params.iter()))
+}
+
 /// Minimum characters for a reverse query. IAST bigrams like `ka` match tens of
 /// thousands of rows and carry no parallel-reading value; this mirrors the
 /// 2-character floor on the Chinese side.
@@ -193,7 +251,7 @@ fn fts_quote(q: &str) -> String {
 }
 
 fn fetch_rows(conn: &Connection, norm_query: &str) -> rusqlite::Result<Vec<Row>> {
-    let (sql, param) = if norm_query.chars().count() >= 3 {
+    let (sql, param) = if norm_query.chars().count() >= FTS_MIN_CHARS {
         (
             "SELECT p.zh_text,p.zh_norm,p.foreign_lang,p.foreign_text,p.confidence,\
                     p.cbeta_id,p.title_zh,p.juan_num \

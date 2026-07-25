@@ -201,6 +201,30 @@ fn fallback_substring_is_reported_in_normalized_form() {
 }
 
 #[test]
+fn fallback_only_suggests_substrings_the_lang_filter_would_show() {
+    let conn = fixture(); // every fixture row is `sa`
+    let bo = vec!["bo".to_string()];
+    let sa = vec!["sa".to_string()];
+
+    // 觀自在菩薩 is in the fixture and is a substring of the query, but only
+    // with a Sanskrit parallel. Under `--lang bo` the very same command could
+    // not display it, so it must not be offered as a hint.
+    let mut filtered_out = req("觀自在菩薩摩訶薩", false);
+    filtered_out.langs = Some(&bo);
+    assert!(
+        run(&conn, &filtered_out).unwrap().fallback.is_none(),
+        "a substring whose only parallels are filtered out is not a hit"
+    );
+
+    // Same query, same substring, a language that IS displayed: the hint
+    // appears, proving the filter above is what suppressed it.
+    let mut displayed = req("觀自在菩薩摩訶薩", false);
+    displayed.langs = Some(&sa);
+    let fb = run(&conn, &displayed).unwrap().fallback.unwrap();
+    assert_eq!(fb.matched_substring, "观自在菩萨");
+}
+
+#[test]
 fn segment_display_is_capped_but_total_is_honest() {
     let conn = fixture();
     for i in 0..5 {
