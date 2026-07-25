@@ -104,21 +104,22 @@ fojin parallel "色即是空" --json
 
 ```json
 {
-  "matched": true,
-  "total": 10,
-  "shown": 1,
   "groups": [
     {
-      "zh_text": "是故菩薩應生如是無住著心，不住色、聲、香、味、觸、法生心，應無所住而生其心。",
       "cbeta_id": "T0237",
-      "title_zh": "金剛般若波羅蜜經",
       "juan_num": 1,
       "parallels": [
-        { "lang": "sa", "text": "tasmāt tarhi subhūte bodhisatvena evaṃ cittam utpādayitavyaṃ apratiṣṭhitaṃ …", "confidence": 1.0 },
-        { "lang": "bo", "text": "བྱང་ཆུབ་སེམས་དཔའ་སེམས་དཔའ་ཆེན་པོས་འདི་ལྟར་མི་གནས་པར་སེམས་བསྐྱེད་པར་བྱའོ་༎ …", "confidence": 1.0 }
-      ]
+        { "confidence": 1.0, "lang": "sa", "text": "tasmāt tarhi subhūte bodhisatvena evaṃ cittam utpādayitavyaṃ apratiṣṭhitaṃ …" },
+        { "confidence": 1.0, "lang": "bo", "text": "བྱང་ཆུབ་སེམས་དཔའ་སེམས་དཔའ་ཆེན་པོས་འདི་ལྟར་མི་གནས་པར་སེམས་བསྐྱེད་པར་བྱའོ་༎ …" }
+      ],
+      "title_zh": "金剛般若波羅蜜經",
+      "zh_text": "是故菩薩應生如是無住著心，不住色、聲、香、味、觸、法生心，應無所住而生其心。"
     }
-  ]
+  ],
+  "matched": true,
+  "schema_version": 1,
+  "shown": 1,
+  "total": 10
 }
 ```
 
@@ -167,8 +168,8 @@ fojin parallel "<汉文短语>" --json --offline
 - 查询须至少 **2 个汉字**;单字查询会被拒绝(范围过大,无对读价值)。
 - **简繁通用、标点无关**:查询前自动做简繁归一并剥离标点——简体「应无所住」可直接命中繁体原文「應無所住而生其心」。
 - 匹配为**整串子串匹配**(FTS5 trigram):查询串须连续完整出现在某条经文分段中。4~12 字的短语/名句命中最佳。
-- **整串查不到时会自动按句切分重查**(加 `--no-split` 关闭),并对仍无命中的分句给出该句中最长的可命中子串。
-- 输入端不再限于汉文:`--from sa` / `--from bo` 可用梵文转写或藏文反查汉文对应(不区分大小写与首字母),反查不做切分与回退。
+- **整串查不到时会自动按句切分重查**(加 `--no-split` 关闭;最多处理 20 句,超出部分会在输出中明确告知),并对仍无命中的分句给出该句中最长的可命中子串(归一化后超过 60 字则不回退;子串为归一化形式——简体、已去标点,可能与原字形不同)。
+- 输入端不再限于汉文:`--from sa` / `--from bo` 可用梵文转写或藏文反查汉文对应(完整 Unicode 大小写折叠;变音符号仍需与原文一致,不做折叠),反查不做切分与回退。
 
 ## 退出码
 
@@ -223,7 +224,7 @@ fojin data status                 # local dataset stats
 fojin data verify                 # verify version, SQLite, and FTS integrity
 ```
 
-- **Input**: Chinese by default (traditional/simplified folded, punctuation ignored); literal substring matching over normalized text, 2-to-12-character phrases work best. A whole-string miss auto-splits into sentences and retries (`--no-split` disables this), falling back to the longest matchable substring per sentence. `--from sa`/`--from bo` reverses the query direction (Sanskrit/Tibetan → Chinese, case/diacritic-insensitive).
+- **Input**: Chinese by default (traditional/simplified folded, punctuation ignored); literal substring matching over normalized text, 2-to-12-character phrases work best. A whole-string miss auto-splits into sentences and retries (`--no-split` disables this; up to 20 sentences are processed, and the output states explicitly if more were skipped), falling back to the longest matchable substring per sentence — skipped once the normalized text exceeds 60 characters, and the returned substring is itself normalized (simplified, punctuation stripped), so it may not match the original characters. `--from sa`/`--from bo` reverses the query direction (Sanskrit/Tibetan → Chinese, full Unicode case folding — diacritics must still match exactly) without splitting or falling back.
 - **Build/install integrity**: building from crates.io or source requires Rust 1.95+ (MSRV 1.95). Starting with v0.3.0, the shell installer requires the target binary release to provide `SHA256SUMS` and verifies the archive before extraction. It fails closed for an older latest or explicitly selected release without that file, including the transition before v0.3.0 is published; use the currently published crates.io version or a source build instead. This does not state that v0.3.0 has been released.
 - **For AI agents**: pure-JSON stdout, semantic exit codes (`0` ok / `1` runtime / `2` usage), zero network with `--offline`. Ready-made Claude Code integration in [`examples/claude/`](examples/claude/).
 - **Data**: 908,620 zh↔sa/bo alignments from Dharmamitra's [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) dataset, redistributed under CC BY-SA 4.0. The official URL, checksum, and compatibility contract remain pinned to `data-v1`; rendering support for future language rows does not mean the official update channel can adopt them without a binary upgrade. Academic use: please cite [Nehrdich & Keutzer (2026)](https://arxiv.org/pdf/2601.06400) — BibTeX in [`DATA_LICENSE`](DATA_LICENSE).

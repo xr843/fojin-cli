@@ -10,7 +10,7 @@ Version 0.3.0 is prepared but has not been published. Its stabilization work inc
 - Data pipeline: move installs and updates to a bounded, disk-streamed, checksum-first pipeline with hard end-to-end HTTP deadlines and rollback-safe Windows replacement backups.
 - Data concurrency: serialize concurrent install, update, and clean operations per data directory, with full candidate validation before publication.
 - Query correctness: make short-query matching literal and remove duplicate parallel text within a match group and language.
-- 检索能力:新增 `--from` 反向查询(梵/藏 → 汉,Unicode 大小写折叠);零命中时自动按句切分重查(`--no-split` 关闭);仍零命中时给出最长可命中子串。`--lang` / `--from` 的未知语种代码现在报用法错误,而非静默返回空结果。
+- 检索能力:新增 `--from` 反向查询(梵/藏 → 汉,Unicode 大小写折叠);零命中时自动按句切分重查(`--no-split` 关闭;最多处理 20 句,超出部分会在输出中明确告知);仍零命中时给出最长可命中子串(归一化后超过 60 字则不回退)。`--lang` / `--from` 的未知语种代码现在报用法错误,而非静默返回空结果。
 - SQLite safety: upgrade the bundled SQLite and verify its runtime version.
 - Release integrity: validate release versions, locked builds, archive contents, checksums, and installer verification.
 - Project governance: document private security reporting and contribution checks, and add issue and pull request templates.
