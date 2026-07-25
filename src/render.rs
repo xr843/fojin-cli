@@ -1,4 +1,5 @@
 use crate::model::MatchGroup;
+use crate::search::SearchOutcome;
 
 pub const FOOTER: &str = "完整上下文见 https://fojin.app  ·  数据 CC BY-SA(Dharmamitra + fojin)";
 
@@ -77,6 +78,15 @@ pub fn render_human(groups: &[MatchGroup], langs: Option<&[String]>, hidden: usi
     }
     out.push_str(&format!("\n{FOOTER}\n"));
     out
+}
+
+pub fn render_outcome_human(outcome: &SearchOutcome, langs: Option<&[String]>) -> String {
+    let hidden = outcome.total - outcome.groups.len();
+    render_human(&outcome.groups, langs, hidden)
+}
+
+pub fn render_outcome_json(outcome: &SearchOutcome) -> String {
+    render_json(&outcome.groups, outcome.total)
 }
 
 fn group_digits(n: u64) -> String {

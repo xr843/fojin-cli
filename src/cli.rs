@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use std::io::Read;
 use std::path::PathBuf;
 
-use crate::{data, normalize, query, render};
+use crate::{data, normalize, query, render, search};
 
 /// Release process sets DATA_SHA256 to the published artifact's checksum.
 pub const DATA_URL: &str =
@@ -50,6 +50,12 @@ pub enum Command {
         /// 指定数据目录(覆盖默认缓存)
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// 反向查询:用该语种的原文查汉文对应(如 --from sa)
+        #[arg(long)]
+        from: Option<String>,
+        /// 零命中时不自动按句切分重查
+        #[arg(long)]
+        no_split: bool,
         /// 不联网;缺数据则报错
         #[arg(long)]
         offline: bool,
@@ -146,6 +152,19 @@ pub enum DataAction {
     },
 }
 
+pub fn compute_search(
+    conn: &Connection,
+    req: &search::SearchRequest,
+    json: bool,
+) -> Result<String> {
+    let outcome = search::run(conn, req)?;
+    Ok(if json {
+        render::render_outcome_json(&outcome)
+    } else {
+        render::render_outcome_human(&outcome, req.langs)
+    })
+}
+
 pub fn compute_output(
     conn: &Connection,
     raw: &str,
@@ -154,22 +173,18 @@ pub fn compute_output(
     limit: Option<usize>,
     json: bool,
 ) -> Result<String> {
-    let map = normalize::load_norm_map(conn)?;
-    let norm = normalize::normalize(raw.trim(), &map);
-    normalize::validate_query_length(&norm)?;
-    let groups_all = query::search(conn, &norm, langs, top)?;
-    let total = groups_all.len();
-    let shown = match limit {
-        Some(n) => n.min(total),
-        None => total,
-    };
-    let shown_groups = &groups_all[..shown];
-    let hidden = total - shown;
-    Ok(if json {
-        render::render_json(shown_groups, total)
-    } else {
-        render::render_human(shown_groups, langs, hidden)
-    })
+    compute_search(
+        conn,
+        &search::SearchRequest {
+            raw,
+            langs,
+            top,
+            limit,
+            from: None,
+            no_split: false,
+        },
+        json,
+    )
 }
 
 pub fn run() -> Result<i32> {
@@ -183,6 +198,8 @@ pub fn run() -> Result<i32> {
             all,
             json,
             data_dir,
+            from,
+            no_split,
             offline,
         } => {
             let raw = match query {
@@ -207,7 +224,18 @@ pub fn run() -> Result<i32> {
                     .collect()
             });
             let limit = if all { None } else { Some(limit_flag) };
-            let out = compute_output(&conn, &raw, langs.as_deref(), top, limit, json)?;
+            let out = compute_search(
+                &conn,
+                &search::SearchRequest {
+                    raw: &raw,
+                    langs: langs.as_deref(),
+                    top,
+                    limit,
+                    from: from.as_deref(),
+                    no_split,
+                },
+                json,
+            )?;
             println!("{out}");
             Ok(0)
         }
