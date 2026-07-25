@@ -70,7 +70,12 @@ pub struct SearchRequest<'a> {
     pub no_split: bool,
 }
 
-/// Skeleton: whole-string query only. Task 6 adds splitting and fallback.
+type GroupKey = (String, Option<String>, Option<i64>);
+
+fn group_key(g: &MatchGroup) -> GroupKey {
+    (g.zh_text.clone(), g.cbeta_id.clone(), g.juan_num)
+}
+
 pub fn run(conn: &Connection, req: &SearchRequest) -> Result<SearchOutcome> {
     if let Some(from_lang) = req.from {
         let needle = req.raw.trim();
@@ -85,8 +90,96 @@ pub fn run(conn: &Connection, req: &SearchRequest) -> Result<SearchOutcome> {
     }
 
     let map = normalize::load_norm_map(conn)?;
-    let norm = normalize::normalize(req.raw.trim(), &map);
+    let raw = req.raw.trim();
+    let norm = normalize::normalize(raw, &map);
     normalize::validate_query_length(&norm)?;
+
     let groups = query::search(conn, &norm, req.langs, req.top)?;
-    Ok(SearchOutcome::plain(groups, req.limit))
+    if !groups.is_empty() {
+        return Ok(SearchOutcome::plain(groups, req.limit));
+    }
+
+    let probe = |candidate: &str| -> Result<bool> {
+        Ok(!query::search(conn, candidate, req.langs, 1)?.is_empty())
+    };
+
+    if !req.no_split {
+        let keep = |seg: &str| {
+            normalize::normalize(seg, &map).chars().count() >= normalize::MIN_QUERY_CHARS
+        };
+        let split = split::split_sentences(raw, keep);
+        if split.segments.len() >= 2 {
+            return split_search(conn, req, &map, &split, &probe);
+        }
+    }
+
+    Ok(SearchOutcome {
+        groups: Vec::new(),
+        total: 0,
+        segments: None,
+        fallback: fallback::longest_matching(&norm, probe)?,
+        truncated_segments: 0,
+    })
+}
+
+fn split_search(
+    conn: &Connection,
+    req: &SearchRequest,
+    map: &normalize::NormMap,
+    split: &split::SplitOutcome,
+    probe: &impl Fn(&str) -> Result<bool>,
+) -> Result<SearchOutcome> {
+    let mut merged: Vec<MatchGroup> = Vec::new();
+    let mut seen: std::collections::HashSet<GroupKey> = std::collections::HashSet::new();
+    let mut segments: Vec<SegmentResult> = Vec::new();
+
+    for text in &split.segments {
+        let seg_norm = normalize::normalize(text, map);
+        let seg_groups = query::search(conn, &seg_norm, req.langs, req.top)?;
+        let total = seg_groups.len();
+
+        // Stable append-then-dedupe: segment order decides position, so output
+        // never drifts with the number of segments.
+        for g in &seg_groups {
+            if seen.insert(group_key(g)) {
+                merged.push(g.clone());
+            }
+        }
+
+        let fb = if total == 0 {
+            fallback::longest_matching(&seg_norm, probe)?
+        } else {
+            None
+        };
+        // `--all` (limit None) lifts the per-segment cap.
+        let shown = match req.limit {
+            Some(n) => n.min(SEGMENT_GROUP_CAP).min(total),
+            None => total,
+        };
+        let mut groups = seg_groups;
+        groups.truncate(shown);
+
+        segments.push(SegmentResult {
+            text: text.clone(),
+            matched: total > 0,
+            total,
+            groups,
+            fallback: fb,
+        });
+    }
+
+    let total = merged.len();
+    let shown = match req.limit {
+        Some(n) => n.min(total),
+        None => total,
+    };
+    merged.truncate(shown);
+
+    Ok(SearchOutcome {
+        groups: merged,
+        total,
+        segments: Some(segments),
+        fallback: None,
+        truncated_segments: split.truncated,
+    })
 }
