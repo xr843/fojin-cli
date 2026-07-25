@@ -335,3 +335,90 @@ fn cite_unknown_id_suggests_texts_lookup() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("fojin texts"), "got: {stdout}");
 }
+
+#[test]
+fn unknown_from_lang_is_a_usage_error_before_touching_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args([
+            "parallel",
+            "śūnyatā",
+            "--from",
+            "sk",
+            "--offline",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("未知语种 `sk`"), "got: {stderr}");
+    assert!(
+        !stderr.contains("本地数据不存在"),
+        "validation must precede data access: {stderr}"
+    );
+}
+
+#[test]
+fn unknown_display_lang_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args([
+            "parallel",
+            "色即是空",
+            "--lang",
+            "sk",
+            "--offline",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("未知语种 `sk`"));
+}
+
+#[test]
+fn from_with_no_split_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args([
+            "parallel",
+            "śūnyatā",
+            "--from",
+            "sa",
+            "--no-split",
+            "--offline",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("--from 不做切分"));
+}
+
+#[test]
+fn short_reverse_query_is_a_runtime_error() {
+    let dir = tempfile::tempdir().unwrap();
+    write_offline_db(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["parallel", "ka", "--from", "sa", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("至少需要 3 个字符"));
+}
