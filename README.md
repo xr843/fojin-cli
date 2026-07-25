@@ -81,6 +81,8 @@ echo "色即是空" | fojin parallel    # 或从 stdin 读取
 | `--json` | 输出机器可读 JSON | — |
 | `--data-dir <path>` | 指定数据目录,覆盖默认缓存位置 | 系统缓存目录 |
 | `--offline` | 不联网;本地数据缺失时直接报错(而非下载) | — |
+| `--from <lang>` | 反向查询:用该语种原文查汉文对应(sa/bo),至少 3 字符 | — |
+| `--no-split` | 零命中时不自动按句切分重查 | — |
 
 示例:
 
@@ -156,6 +158,7 @@ fojin parallel "<汉文短语>" --json --offline
 - 现成集成包见 [`examples/claude/`](examples/claude/):Claude Code 斜杠命令 + CLAUDE.md 片段,
   其他框架(function calling 等)可照搬其中的调用约定。
 - 边界:无语义搜索、无巴利、无翻译——这三样请接 [Dharmamitra](https://dharmamitra.org) 在线 API,与本工具互补。
+- `--json` 输出含 `schema_version`(当前为 `1`);切分发生时额外带 `segments[]`,整串回退时额外带 `fallback{}`,`matched`/`total`/`shown`/`groups` 四个字段语义不变。
 
 更多集成样例(jq 管道、批量查询、Python 调用)见 [`examples/`](examples/)。
 
@@ -163,8 +166,9 @@ fojin parallel "<汉文短语>" --json --offline
 
 - 查询须至少 **2 个汉字**;单字查询会被拒绝(范围过大,无对读价值)。
 - **简繁通用、标点无关**:查询前自动做简繁归一并剥离标点——简体「应无所住」可直接命中繁体原文「應無所住而生其心」。
-- 匹配为**整串子串匹配**(FTS5 trigram):查询串须连续完整出现在某条经文分段中。4~12 字的短语/名句命中最佳;整段文字超出分段长度,基本查不到——请拆成短句分别查。
-- 输入端仅支持汉文(查询方向:汉 → 梵/藏);用梵文转写或藏文查询不会报错,但必然「未找到对齐」。
+- 匹配为**整串子串匹配**(FTS5 trigram):查询串须连续完整出现在某条经文分段中。4~12 字的短语/名句命中最佳。
+- **整串查不到时会自动按句切分重查**(加 `--no-split` 关闭),并对仍无命中的分句给出该句中最长的可命中子串。
+- 输入端不再限于汉文:`--from sa` / `--from bo` 可用梵文转写或藏文反查汉文对应(不区分大小写与首字母),反查不做切分与回退。
 
 ## 退出码
 
@@ -219,7 +223,7 @@ fojin data status                 # local dataset stats
 fojin data verify                 # verify version, SQLite, and FTS integrity
 ```
 
-- **Input**: Chinese only (traditional/simplified folded, punctuation ignored); literal substring matching over normalized text. 2-to-12-character phrases work best.
+- **Input**: Chinese by default (traditional/simplified folded, punctuation ignored); literal substring matching over normalized text, 2-to-12-character phrases work best. A whole-string miss auto-splits into sentences and retries (`--no-split` disables this), falling back to the longest matchable substring per sentence. `--from sa`/`--from bo` reverses the query direction (Sanskrit/Tibetan → Chinese, case/diacritic-insensitive).
 - **Build/install integrity**: building from crates.io or source requires Rust 1.95+ (MSRV 1.95). Starting with v0.3.0, the shell installer requires the target binary release to provide `SHA256SUMS` and verifies the archive before extraction. It fails closed for an older latest or explicitly selected release without that file, including the transition before v0.3.0 is published; use the currently published crates.io version or a source build instead. This does not state that v0.3.0 has been released.
 - **For AI agents**: pure-JSON stdout, semantic exit codes (`0` ok / `1` runtime / `2` usage), zero network with `--offline`. Ready-made Claude Code integration in [`examples/claude/`](examples/claude/).
 - **Data**: 908,620 zh↔sa/bo alignments from Dharmamitra's [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) dataset, redistributed under CC BY-SA 4.0. The official URL, checksum, and compatibility contract remain pinned to `data-v1`; rendering support for future language rows does not mean the official update channel can adopt them without a binary upgrade. Academic use: please cite [Nehrdich & Keutzer (2026)](https://arxiv.org/pdf/2601.06400) — BibTeX in [`DATA_LICENSE`](DATA_LICENSE).

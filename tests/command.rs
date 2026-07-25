@@ -422,3 +422,77 @@ fn short_reverse_query_is_a_runtime_error() {
         .unwrap()
         .contains("至少需要 3 个字符"));
 }
+
+fn write_split_fixture(dir: &std::path::Path) {
+    let db_path = dir.join("data.sqlite");
+    let conn = Connection::open(db_path).unwrap();
+    init_schema(&conn).unwrap();
+    for (k, v) in [("version", "v1"), ("norm_ruleset", "t2s-char-1to1-v1")] {
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES (?1,?2)",
+            rusqlite::params![k, v],
+        )
+        .unwrap();
+    }
+    for (zt, zn, f) in [
+        ("色即是空", "色即是空", "rūpaṃ śūnyatā"),
+        ("受想行識", "受想行识", "vedanā saṃjñā"),
+    ] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?2,'sa',?3,1.0,'T0251','心經',1)",
+            rusqlite::params![zt, zn, f],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn long_query_splits_and_stdout_stays_pure_json() {
+    let dir = tempfile::tempdir().unwrap();
+    write_split_fixture(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args([
+            "parallel",
+            "色即是空，受想行識",
+            "--json",
+            "--offline",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be pure JSON");
+    assert_eq!(v["schema_version"], serde_json::json!(1));
+    assert_eq!(v["segments"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn reverse_lookup_finds_chinese_from_sanskrit() {
+    let dir = tempfile::tempdir().unwrap();
+    write_split_fixture(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args([
+            "parallel",
+            "śūnyatā",
+            "--from",
+            "sa",
+            "--json",
+            "--offline",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(v["matched"], serde_json::json!(true));
+    assert_eq!(v["groups"][0]["zh_text"], serde_json::json!("色即是空"));
+}
