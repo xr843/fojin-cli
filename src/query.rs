@@ -53,32 +53,118 @@ pub fn search_foreign(
     if needle.is_empty() {
         return Ok(vec![]);
     }
+    let query_chars = needle.chars().count();
 
     // Pass 1: locate hit groups, scanning only the source language's rows.
+    // The (exact, excess_chars) ranking signal is recorded here, from the
+    // actual matching `foreign_text` — it must NOT be recomputed later from
+    // whatever row happens to survive the caller's display `--lang` filter,
+    // since that row can be in a different, non-matching language (see
+    // group_and_rank's `MatchColumn::Precomputed` arm). A group can have
+    // several `from_lang` witnesses; keep the best signal per group: `exact`
+    // is OR'd, `excess_chars` is MIN'd. Both are commutative/associative, so
+    // no tie-break on processing order is needed for determinism.
     let mut stmt = conn.prepare(
         "SELECT zh_text, cbeta_id, juan_num, foreign_text \
          FROM parallels WHERE foreign_lang = ?1",
     )?;
-    let mut hits: HashSet<(String, Option<String>, Option<i64>)> = HashSet::new();
+    let mut hit_signals: HashMap<GroupKey, (bool, usize)> = HashMap::new();
     let mut rows = stmt.query([from_lang])?;
     while let Some(row) = rows.next()? {
         let foreign_text: String = row.get(3)?;
-        if !foreign_text.to_lowercase().contains(&needle) {
+        let hay = foreign_text.to_lowercase();
+        if !hay.contains(&needle) {
             continue;
         }
-        hits.insert((row.get(0)?, row.get(1)?, row.get(2)?));
+        let exact = hay == needle;
+        let excess_chars = hay.chars().count().saturating_sub(query_chars);
+        let key = GroupKey {
+            zh_text: row.get(0)?,
+            cbeta_id: row.get(1)?,
+            juan_num: row.get(2)?,
+        };
+        hit_signals
+            .entry(key)
+            .and_modify(|signal| {
+                signal.0 |= exact;
+                if excess_chars < signal.1 {
+                    signal.1 = excess_chars;
+                }
+            })
+            .or_insert((exact, excess_chars));
     }
-    if hits.is_empty() {
+    if hit_signals.is_empty() {
         return Ok(vec![]);
     }
 
-    // Pass 2: pull every language's rows for the hit groups.
-    let mut stmt = conn.prepare(
-        "SELECT zh_text,zh_norm,foreign_lang,foreign_text,confidence,\
-                cbeta_id,title_zh,juan_num FROM parallels",
-    )?;
+    // Pass 2: pull every language's rows for the hit groups, narrowed to
+    // their `cbeta_id`s so we don't materialize the whole table (~900k rows,
+    // no index on `cbeta_id`) just to keep a handful of groups. `cbeta_id`
+    // is nullable and SQL `IN` never matches NULL, so hit groups with a NULL
+    // `cbeta_id` are fetched separately via a dedicated `IS NULL` query.
+    // SQLite's default bound-parameter limit is 999 and the dataset has
+    // ~1016 distinct `cbeta_id`s, so the `IN` list is batched — the whole
+    // dataset fits in two batches at `CBETA_ID_BATCH`, comfortably under the
+    // limit, rather than risking "too many SQL variables" or silently
+    // falling back to the unbounded scan this fix exists to avoid.
+    const CBETA_ID_BATCH: usize = 500;
+    let mut cbeta_ids: Vec<String> = Vec::new();
+    let mut seen_ids: HashSet<&str> = HashSet::new();
+    let mut has_null_cbeta_id = false;
+    for key in hit_signals.keys() {
+        match &key.cbeta_id {
+            Some(id) => {
+                if seen_ids.insert(id.as_str()) {
+                    cbeta_ids.push(id.clone());
+                }
+            }
+            None => has_null_cbeta_id = true,
+        }
+    }
+
     let mut collected: Vec<Row> = Vec::new();
-    let mut rows = stmt.query([])?;
+    for batch in cbeta_ids.chunks(CBETA_ID_BATCH) {
+        let placeholders = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT zh_text,zh_norm,foreign_lang,foreign_text,confidence,\
+                    cbeta_id,title_zh,juan_num \
+             FROM parallels WHERE cbeta_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(batch.iter()))?;
+        collect_hit_rows(&mut rows, &hit_signals, &mut collected)?;
+    }
+    if has_null_cbeta_id {
+        let mut stmt = conn.prepare(
+            "SELECT zh_text,zh_norm,foreign_lang,foreign_text,confidence,\
+                    cbeta_id,title_zh,juan_num \
+             FROM parallels WHERE cbeta_id IS NULL",
+        )?;
+        let mut rows = stmt.query([])?;
+        collect_hit_rows(&mut rows, &hit_signals, &mut collected)?;
+    }
+
+    Ok(group_and_rank(
+        collected,
+        &needle,
+        langs,
+        top,
+        MatchColumn::Precomputed(&hit_signals),
+    ))
+}
+
+/// Shared row-materializing loop for pass 2's batched queries: keep only
+/// rows whose full group key (`zh_text`, `cbeta_id`, `juan_num`) is an
+/// actual pass-1 hit — the `cbeta_id`-only SQL narrowing can still return
+/// siblings under the same text that aren't part of any hit group (same
+/// `cbeta_id`, different juan or segment).
+fn collect_hit_rows(
+    rows: &mut rusqlite::Rows<'_>,
+    hit_signals: &HashMap<GroupKey, (bool, usize)>,
+    collected: &mut Vec<Row>,
+) -> rusqlite::Result<()> {
     while let Some(r) = rows.next()? {
         let row = Row {
             zh_text: r.get(0)?,
@@ -90,19 +176,16 @@ pub fn search_foreign(
             title_zh: r.get(6)?,
             juan_num: r.get(7)?,
         };
-        let key = (row.zh_text.clone(), row.cbeta_id.clone(), row.juan_num);
-        if hits.contains(&key) {
+        let key = GroupKey {
+            zh_text: row.zh_text.clone(),
+            cbeta_id: row.cbeta_id.clone(),
+            juan_num: row.juan_num,
+        };
+        if hit_signals.contains_key(&key) {
             collected.push(row);
         }
     }
-
-    Ok(group_and_rank(
-        collected,
-        &needle,
-        langs,
-        top,
-        MatchColumn::ForeignText,
-    ))
+    Ok(())
 }
 
 fn fts_quote(q: &str) -> String {
@@ -149,11 +232,20 @@ struct GroupKey {
     juan_num: Option<i64>,
 }
 
-/// Which column the query string is measured against when ranking groups.
+/// How a row's ranking signal (`exact`, `excess_chars`) is determined.
+///
+/// `ZhNorm` (forward search) computes it per row from `zh_norm`, which is
+/// identical across every row in a group, so per-row computation is exact.
+/// `Precomputed` (reverse search) instead looks up a per-group signal that
+/// pass 1 already derived from the actual `from_lang`-matching text — it
+/// must NOT be recomputed from `row.foreign_text` here, because by the time
+/// a row reaches this loop it may have been kept only for *display*
+/// (post `--lang` filtering) and be in a language that never matched the
+/// query at all.
 #[derive(Clone, Copy)]
-enum MatchColumn {
+enum MatchColumn<'a> {
     ZhNorm,
-    ForeignText,
+    Precomputed(&'a HashMap<GroupKey, (bool, usize)>),
 }
 
 struct Acc {
@@ -183,21 +275,25 @@ fn group_and_rank(
                 continue;
             }
         }
-        let hay = match column {
-            MatchColumn::ZhNorm => row.zh_norm.clone(),
-            MatchColumn::ForeignText => row.foreign_text.to_lowercase(),
-        };
-        let contains = hay.contains(needle);
-        let exact = hay == needle;
-        let excess_chars = if contains {
-            hay.chars().count().saturating_sub(query_chars)
-        } else {
-            hay.chars().count()
-        };
         let key = GroupKey {
             zh_text: row.zh_text.clone(),
             cbeta_id: row.cbeta_id.clone(),
             juan_num: row.juan_num,
+        };
+        let (exact, excess_chars) = match column {
+            MatchColumn::ZhNorm => {
+                let hay = row.zh_norm.as_str();
+                let contains = hay.contains(needle);
+                let excess_chars = if contains {
+                    hay.chars().count().saturating_sub(query_chars)
+                } else {
+                    hay.chars().count()
+                };
+                (hay == needle, excess_chars)
+            }
+            MatchColumn::Precomputed(signals) => *signals
+                .get(&key)
+                .expect("pass 1 recorded a signal for every hit group key reaching pass 2"),
         };
         let idx = match acc_idx.get(&key).copied() {
             Some(i) => i,

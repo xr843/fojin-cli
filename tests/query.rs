@@ -554,3 +554,84 @@ fn known_lang_absent_from_dataset_answers_empty_not_error() {
     let g = search_foreign(&conn, "pi", "dukkha", None, 3).unwrap();
     assert!(g.is_empty());
 }
+
+#[test]
+fn foreign_search_group_ranking_uses_pass1_match_not_display_filtered_text() {
+    // Two hit groups: A is a tight Sanskrit match (exact) with a long
+    // Tibetan display text; B is a loose Sanskrit match (lots of excess)
+    // with a short Tibetan display text. Under `--from sa --lang bo`, the
+    // display filter removes the `sa` rows before any ranking signal is
+    // computed for them — if ranking is (mis)computed from whatever text
+    // survives that filter, B's short-but-irrelevant Tibetan text looks
+    // like the tighter match and B wrongly sorts first. Ranking must
+    // instead come from the actual pass-1 Sanskrit match, which correctly
+    // ranks A first (exact match) regardless of what --lang keeps for
+    // display.
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let rows = [
+        ("色空A", "色空a", "sa", "sunyata", "T0301", "甲經", 1_i64),
+        (
+            "色空A",
+            "色空a",
+            "bo",
+            "gzugs stong pa nyid do zhes bya ba dang ldan pa",
+            "T0301",
+            "甲經",
+            1,
+        ),
+        (
+            "色空B",
+            "色空b",
+            "sa",
+            "sunyata yatha rupam vedana samjna",
+            "T0302",
+            "乙經",
+            1,
+        ),
+        ("色空B", "色空b", "bo", "stong", "T0302", "乙經", 1),
+    ];
+    for (zt, zn, lang, f, cb, ti, j) in rows {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?2,?3,?4,1.0,?5,?6,?7)",
+            params![zt, zn, lang, f, cb, ti, j],
+        )
+        .unwrap();
+    }
+
+    let langs = vec!["bo".to_string()];
+    let groups = search_foreign(&conn, "sa", "sunyata", Some(&langs), 3).unwrap();
+    assert_eq!(groups.len(), 2, "both groups matched via Sanskrit");
+    assert_eq!(
+        groups[0].zh_text, "色空A",
+        "the tighter Sanskrit match must rank first even though its Tibetan \
+         display text is longer than the loose match's short Tibetan text"
+    );
+}
+
+#[test]
+fn foreign_search_narrowed_pass2_still_finds_null_cbeta_id_group() {
+    // Pass 2 narrows by `cbeta_id`, which is nullable; a naive `IN (...)`
+    // never matches NULL, so a hit group with no `cbeta_id` must still be
+    // retrieved via a dedicated NULL-handling path.
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    for (lang, f) in [("sa", "sunyata"), ("bo", "gzugs stong pa")] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES ('色即是空','色即是空',?1,?2,1.0,NULL,NULL,NULL)",
+            params![lang, f],
+        )
+        .unwrap();
+    }
+
+    let g = search_foreign(&conn, "sa", "sunyata", None, 3).unwrap();
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].cbeta_id, None);
+    assert_eq!(
+        g[0].parallels.len(),
+        2,
+        "narrowing pass 2 by cbeta_id must still surface NULL-cbeta_id groups"
+    );
+}
