@@ -65,17 +65,21 @@ pub fn ensure_cbeta_index(conn: &rusqlite::Connection) {
     let Ok(_lock) = operation_lock::try_acquire(&path) else {
         return;
     };
-    // Open read-write BEFORE announcing. Opening is the only reliable
-    // writability signal — SQLite needs the containing directory writable for
-    // its rollback journal, which file permissions alone do not tell us — and
-    // doing it first keeps a read-only install completely silent.
+    // Writability cannot be reliably predicted before we actually try to
+    // write: SQLite defers creating its rollback journal until the write
+    // itself, so a successful read-write `open` (and even a `SELECT`) tells
+    // us nothing — a directory that forbids new files will still let an
+    // existing, writable database file open cleanly. So we don't announce
+    // anything up front; we only report the build after `CREATE INDEX` has
+    // actually succeeded.
     let Ok(writable) =
         rusqlite::Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
     else {
         return;
     };
-    eprintln!("首次按经号查询,正在建立索引(一次性,约 1-2 秒,数据目录约 +17 MB)...");
-    let _ = create_cbeta_index(&writable);
+    if create_cbeta_index(&writable).is_ok() {
+        eprintln!("已为按经号查询建立索引(一次性,数据目录增加约 17 MB)。");
+    }
 }
 
 pub struct DataSource<'a> {

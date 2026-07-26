@@ -607,6 +607,11 @@ fn cite_builds_the_missing_index_and_output_is_unchanged() {
         .unwrap();
     assert_eq!(first.status.code(), Some(0));
     assert!(index_exists(dir.path()), "cite must have built the index");
+    assert!(
+        String::from_utf8_lossy(&first.stderr).contains("建立索引"),
+        "the first run actually built the index, so it must announce it: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
 
     // Second run: index already present, so no rebuild and no notice. This is
     // also the idempotency check — `ensure_cbeta_index` returns before it even
@@ -723,4 +728,63 @@ fn cite_degrades_gracefully_when_the_data_dir_is_read_only() {
     assert!(String::from_utf8(output.stdout)
         .unwrap()
         .contains("色即是空"));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("建立索引"),
+        "a fresh read-only directory must never build the index, so it must not announce one: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !index_exists(dir.path()),
+        "a read-only directory must not have the index"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cite_stays_silent_when_a_preexisting_lock_file_meets_a_read_only_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_cite_fixture(dir.path());
+
+    // A lock file left behind by any earlier `cite` or `data update` run
+    // already exists here, unlocked. `try_acquire` succeeds on it, so the
+    // code reaches the read-write open, which also succeeds — the file
+    // itself is writable. Only the later `CREATE INDEX` fails, once the
+    // directory itself blocks the new file SQLite needs for its rollback
+    // journal. A pre-success notice would fire every single time despite the
+    // index never actually being built.
+    std::fs::File::create(dir.path().join("data.sqlite.lock")).unwrap();
+
+    let original = std::fs::metadata(dir.path()).unwrap().permissions();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["cite", "T0251", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    // Restore before asserting so a failure still leaves a removable tempdir.
+    std::fs::set_permissions(dir.path(), original).unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a read-only data dir must not fail the query: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("色即是空"));
+    assert!(
+        !String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("建立索引"),
+        "must not announce an index build that never actually completed"
+    );
+    assert!(
+        !index_exists(dir.path()),
+        "the read-only directory must have blocked index creation"
+    );
 }
