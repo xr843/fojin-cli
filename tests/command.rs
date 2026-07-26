@@ -335,3 +335,223 @@ fn cite_unknown_id_suggests_texts_lookup() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("fojin texts"), "got: {stdout}");
 }
+
+#[test]
+fn unknown_from_lang_is_a_usage_error_before_touching_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args([
+            "parallel",
+            "śūnyatā",
+            "--from",
+            "sk",
+            "--offline",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("未知语种 `sk`"), "got: {stderr}");
+    assert!(
+        !stderr.contains("本地数据不存在"),
+        "validation must precede data access: {stderr}"
+    );
+}
+
+#[test]
+fn unknown_from_lang_outranks_the_query_length_preflight() {
+    // A one-character query also fails the length pre-flight, which exits 1
+    // with advice about 汉字 — nonsense for a reverse query and the wrong exit
+    // code for a bad flag. Usage errors must be reported first.
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["parallel", "ś", "--from", "sk", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("未知语种 `sk`"), "got: {stderr}");
+    assert!(
+        !stderr.contains("至少需要 2 个汉字"),
+        "the length pre-flight must not preempt the usage error: {stderr}"
+    );
+}
+
+#[test]
+fn unknown_display_lang_outranks_the_query_length_preflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["parallel", "色", "--lang", "sk", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("未知语种 `sk`"), "got: {stderr}");
+    assert!(
+        !stderr.contains("至少需要 2 个汉字"),
+        "the length pre-flight must not preempt the usage error: {stderr}"
+    );
+}
+
+#[test]
+fn single_char_query_is_still_a_runtime_error_when_flags_are_valid() {
+    // The reorder must not weaken the pre-flight itself: with nothing else
+    // wrong, a one-character query still fails before any data is opened.
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["parallel", "色", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("至少需要 2 个汉字"), "got: {stderr}");
+    assert!(
+        !stderr.contains("本地数据不存在"),
+        "the pre-flight must still precede data access: {stderr}"
+    );
+}
+
+#[test]
+fn unknown_display_lang_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args([
+            "parallel",
+            "色即是空",
+            "--lang",
+            "sk",
+            "--offline",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("未知语种 `sk`"));
+}
+
+#[test]
+fn from_with_no_split_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args([
+            "parallel",
+            "śūnyatā",
+            "--from",
+            "sa",
+            "--no-split",
+            "--offline",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("--from 不做切分"));
+}
+
+#[test]
+fn short_reverse_query_is_a_runtime_error() {
+    let dir = tempfile::tempdir().unwrap();
+    write_offline_db(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["parallel", "ka", "--from", "sa", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("至少需要 3 个字符"));
+}
+
+fn write_split_fixture(dir: &std::path::Path) {
+    let db_path = dir.join("data.sqlite");
+    let conn = Connection::open(db_path).unwrap();
+    init_schema(&conn).unwrap();
+    for (k, v) in [("version", "v1"), ("norm_ruleset", "t2s-char-1to1-v1")] {
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES (?1,?2)",
+            rusqlite::params![k, v],
+        )
+        .unwrap();
+    }
+    for (zt, zn, f) in [
+        ("色即是空", "色即是空", "rūpaṃ śūnyatā"),
+        ("受想行識", "受想行识", "vedanā saṃjñā"),
+    ] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?2,'sa',?3,1.0,'T0251','心經',1)",
+            rusqlite::params![zt, zn, f],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn long_query_splits_and_stdout_stays_pure_json() {
+    let dir = tempfile::tempdir().unwrap();
+    write_split_fixture(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args([
+            "parallel",
+            "色即是空，受想行識",
+            "--json",
+            "--offline",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be pure JSON");
+    assert_eq!(v["schema_version"], serde_json::json!(1));
+    assert_eq!(v["segments"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn reverse_lookup_finds_chinese_from_sanskrit() {
+    let dir = tempfile::tempdir().unwrap();
+    write_split_fixture(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args([
+            "parallel",
+            "śūnyatā",
+            "--from",
+            "sa",
+            "--json",
+            "--offline",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(v["matched"], serde_json::json!(true));
+    assert_eq!(v["groups"][0]["zh_text"], serde_json::json!("色即是空"));
+}

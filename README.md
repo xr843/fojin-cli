@@ -5,7 +5,7 @@
 [![release](https://img.shields.io/github/v/release/xr843/fojin-cli?filter=v*&label=release)](https://github.com/xr843/fojin-cli/releases/latest)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可)
 
-**离线 · 无需登录 · 单二进制。** 给一段汉文,查它在梵/藏正典中的平行文本。本地查询毫秒级(实测典型 2 ms,数千组命中的高频词约 0.3 s)。
+**离线 · 无需登录 · 单二进制。** 给一段汉文,查它在梵/藏正典中的平行文本。命中时本地查询毫秒级(实测典型 2 ms,数千组命中的高频词约 0.3 s);零命中并触发切分与回退时更慢,实测单串约 13 ms、20 句的长输入约 0.33 s。
 
 *English readers: see the [English summary](#english-summary) at the bottom.*
 
@@ -81,6 +81,8 @@ echo "色即是空" | fojin parallel    # 或从 stdin 读取
 | `--json` | 输出机器可读 JSON | — |
 | `--data-dir <path>` | 指定数据目录,覆盖默认缓存位置 | 系统缓存目录 |
 | `--offline` | 不联网;本地数据缺失时直接报错(而非下载) | — |
+| `--from <lang>` | 反向查询:用该语种原文查汉文对应(sa/bo),至少 3 字符 | — |
+| `--no-split` | 零命中时不自动按句切分重查 | — |
 
 示例:
 
@@ -102,25 +104,30 @@ fojin parallel "色即是空" --json
 
 ```json
 {
-  "matched": true,
-  "total": 10,
-  "shown": 1,
   "groups": [
     {
-      "zh_text": "是故菩薩應生如是無住著心，不住色、聲、香、味、觸、法生心，應無所住而生其心。",
-      "cbeta_id": "T0237",
-      "title_zh": "金剛般若波羅蜜經",
-      "juan_num": 1,
+      "cbeta_id": "T0310",
+      "juan_num": 2,
       "parallels": [
-        { "lang": "sa", "text": "tasmāt tarhi subhūte bodhisatvena evaṃ cittam utpādayitavyaṃ apratiṣṭhitaṃ …", "confidence": 1.0 },
-        { "lang": "bo", "text": "བྱང་ཆུབ་སེམས་དཔའ་སེམས་དཔའ་ཆེན་པོས་འདི་ལྟར་མི་གནས་པར་སེམས་བསྐྱེད་པར་བྱའོ་༎ …", "confidence": 1.0 }
-      ]
+        {
+          "confidence": 1.0,
+          "lang": "bo",
+          "text": "ཁྱེད་མཚན་མའི་འདུ་ཤེས་མ་བྱེད་ཅིག་།"
+        }
+      ],
+      "title_zh": "大寶積經",
+      "zh_text": "勿於處所生住著心，應無所住。"
     }
-  ]
+  ],
+  "matched": true,
+  "schema_version": 1,
+  "shown": 1,
+  "total": 10
 }
 ```
 
-(示例取自真实查询 `fojin parallel "应无所住" --json --top 1 --limit 1`,文本有截断;字段实际按字母序输出。)
+(以上是 `fojin parallel "应无所住" --json --top 1 --limit 1` 的完整真实输出,未作删改;
+`--top 1` 只保留每语一条,`--limit 1` 只保留 10 组匹配中的第一组,字段按字母序输出。)
 
 ## 其他子命令
 
@@ -156,6 +163,7 @@ fojin parallel "<汉文短语>" --json --offline
 - 现成集成包见 [`examples/claude/`](examples/claude/):Claude Code 斜杠命令 + CLAUDE.md 片段,
   其他框架(function calling 等)可照搬其中的调用约定。
 - 边界:无语义搜索、无巴利、无翻译——这三样请接 [Dharmamitra](https://dharmamitra.org) 在线 API,与本工具互补。
+- `--json` 输出含 `schema_version`(当前为 `1`);切分发生时额外带 `segments[]`,整串回退时额外带 `fallback{}`,`matched`/`total`/`shown`/`groups` 四个字段语义不变。
 
 更多集成样例(jq 管道、批量查询、Python 调用)见 [`examples/`](examples/)。
 
@@ -163,8 +171,10 @@ fojin parallel "<汉文短语>" --json --offline
 
 - 查询须至少 **2 个汉字**;单字查询会被拒绝(范围过大,无对读价值)。
 - **简繁通用、标点无关**:查询前自动做简繁归一并剥离标点——简体「应无所住」可直接命中繁体原文「應無所住而生其心」。
-- 匹配为**整串子串匹配**(FTS5 trigram):查询串须连续完整出现在某条经文分段中。4~12 字的短语/名句命中最佳;整段文字超出分段长度,基本查不到——请拆成短句分别查。
-- 输入端仅支持汉文(查询方向:汉 → 梵/藏);用梵文转写或藏文查询不会报错,但必然「未找到对齐」。
+- 匹配为**整串子串匹配**(FTS5 trigram):查询串须连续完整出现在某条经文分段中。4~12 字的短语/名句命中最佳。
+- **整串查不到时会自动按句切分重查**(加 `--no-split` 关闭;最多处理 20 句,超出部分会在输出中明确告知),并对仍无命中的分句给出该句中最长的可命中子串(子串至少 3 字——更短的子串在 90 万行语料里几乎必然命中,提示没有信息量;查询归一化后超过 60 字则不回退;子串为归一化形式——简体、已去标点,可能与原字形不同)。
+- 切句只按**句级**标点(`，。；：！？` 及对应半角、换行);顿号 `、` 不算——佛典列举(色聲香味觸法)本身就是一条对齐分段,在那里断会把它切碎。
+- 输入端不再限于汉文:`--from sa` / `--from bo` 可用梵文转写或藏文反查汉文对应(完整 Unicode 大小写折叠;变音符号仍需与原文一致,不做折叠),反查不做切分与回退。
 
 ## 退出码
 
@@ -208,7 +218,7 @@ fojin parallel "<汉文短语>" --json --offline
 
 ## English Summary
 
-**fojin-cli** is an offline command-line tool: give it a Chinese Buddhist canonical passage, it returns the aligned Sanskrit/Tibetan parallels — from a local SQLite, in ~2 ms, fully offline after a one-time 183 MB data download. Single binary, no account, deterministic output.
+**fojin-cli** is an offline command-line tool: give it a Chinese Buddhist canonical passage, it returns the aligned Sanskrit/Tibetan parallels — from a local SQLite, in ~2 ms on a hit (a zero-hit query that falls through to sentence splitting and substring fallback costs more — up to ~0.33 s measured), fully offline after a one-time 183 MB data download. Single binary, no account, deterministic output.
 
 ```bash
 cargo install fojin-cli --locked # or: curl -fsSL https://raw.githubusercontent.com/xr843/fojin-cli/master/install.sh | sh
@@ -219,7 +229,7 @@ fojin data status                 # local dataset stats
 fojin data verify                 # verify version, SQLite, and FTS integrity
 ```
 
-- **Input**: Chinese only (traditional/simplified folded, punctuation ignored); literal substring matching over normalized text. 2-to-12-character phrases work best.
+- **Input**: Chinese by default (traditional/simplified folded, punctuation ignored); literal substring matching over normalized text, 2-to-12-character phrases work best. A whole-string miss auto-splits into sentences and retries (`--no-split` disables this; up to 20 sentences are processed, and the output states explicitly if more were skipped), falling back to the longest matchable substring per sentence — skipped once the normalized text exceeds 60 characters, and the returned substring is itself normalized (simplified, punctuation stripped), so it may not match the original characters. `--from sa`/`--from bo` reverses the query direction (Sanskrit/Tibetan → Chinese, full Unicode case folding — diacritics must still match exactly) without splitting or falling back.
 - **Build/install integrity**: building from crates.io or source requires Rust 1.95+ (MSRV 1.95). Starting with v0.3.0, the shell installer requires the target binary release to provide `SHA256SUMS` and verifies the archive before extraction. It fails closed for an older latest or explicitly selected release without that file, including the transition before v0.3.0 is published; use the currently published crates.io version or a source build instead. This does not state that v0.3.0 has been released.
 - **For AI agents**: pure-JSON stdout, semantic exit codes (`0` ok / `1` runtime / `2` usage), zero network with `--offline`. Ready-made Claude Code integration in [`examples/claude/`](examples/claude/).
 - **Data**: 908,620 zh↔sa/bo alignments from Dharmamitra's [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) dataset, redistributed under CC BY-SA 4.0. The official URL, checksum, and compatibility contract remain pinned to `data-v1`; rendering support for future language rows does not mean the official update channel can adopt them without a binary upgrade. Academic use: please cite [Nehrdich & Keutzer (2026)](https://arxiv.org/pdf/2601.06400) — BibTeX in [`DATA_LICENSE`](DATA_LICENSE).

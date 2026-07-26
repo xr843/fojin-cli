@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use std::io::Read;
 use std::path::PathBuf;
 
-use crate::{data, normalize, query, render};
+use crate::{data, lang, normalize, query, render, search};
 
 /// Release process sets DATA_SHA256 to the published artifact's checksum.
 pub const DATA_URL: &str =
@@ -50,6 +50,12 @@ pub enum Command {
         /// 指定数据目录(覆盖默认缓存)
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// 反向查询:用该语种的原文查汉文对应(如 --from sa)
+        #[arg(long)]
+        from: Option<String>,
+        /// 零命中时不自动按句切分重查
+        #[arg(long)]
+        no_split: bool,
         /// 不联网;缺数据则报错
         #[arg(long)]
         offline: bool,
@@ -146,6 +152,19 @@ pub enum DataAction {
     },
 }
 
+pub fn compute_search(
+    conn: &Connection,
+    req: &search::SearchRequest,
+    json: bool,
+) -> Result<String> {
+    let outcome = search::run(conn, req)?;
+    Ok(if json {
+        render::render_outcome_json(&outcome)
+    } else {
+        render::render_outcome_human(&outcome, req.langs)
+    })
+}
+
 pub fn compute_output(
     conn: &Connection,
     raw: &str,
@@ -154,22 +173,18 @@ pub fn compute_output(
     limit: Option<usize>,
     json: bool,
 ) -> Result<String> {
-    let map = normalize::load_norm_map(conn)?;
-    let norm = normalize::normalize(raw.trim(), &map);
-    normalize::validate_query_length(&norm)?;
-    let groups_all = query::search(conn, &norm, langs, top)?;
-    let total = groups_all.len();
-    let shown = match limit {
-        Some(n) => n.min(total),
-        None => total,
-    };
-    let shown_groups = &groups_all[..shown];
-    let hidden = total - shown;
-    Ok(if json {
-        render::render_json(shown_groups, total)
-    } else {
-        render::render_human(shown_groups, langs, hidden)
-    })
+    compute_search(
+        conn,
+        &search::SearchRequest {
+            raw,
+            langs,
+            top,
+            limit,
+            from: None,
+            no_split: false,
+        },
+        json,
+    )
 }
 
 pub fn run() -> Result<i32> {
@@ -183,6 +198,8 @@ pub fn run() -> Result<i32> {
             all,
             json,
             data_dir,
+            from,
+            no_split,
             offline,
         } => {
             let raw = match query {
@@ -197,17 +214,45 @@ pub fn run() -> Result<i32> {
                 eprintln!("用法: fojin parallel \"色即是空\"  (或管道: echo ... | fojin parallel)");
                 return Ok(2);
             }
-            let preflight = normalize::normalize(raw.trim(), &normalize::NormMap::new());
-            normalize::validate_query_length(&preflight)?;
-            let conn = open_ensured(data_dir, offline)?;
+            if from.is_some() && no_split {
+                eprintln!("--from 不做切分,不能与 --no-split 同用");
+                return Ok(2);
+            }
+            if let Some(code) = from.as_deref() {
+                if let Err(e) = crate::lang::validate_langs(&[code.to_string()]) {
+                    eprintln!("{e}");
+                    return Ok(2);
+                }
+            }
             let langs: Option<Vec<String>> = lang.map(|l| {
                 l.split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect()
             });
+            if let Some(code) = validate_langs_arg(langs.as_deref()) {
+                return Ok(code);
+            }
+            // Usage errors (exit 2) outrank this runtime pre-flight (exit 1):
+            // a query too short to be useful is still a *query* problem, and
+            // reporting it first would mask an unknown `--from`/`--lang` code
+            // behind both the wrong exit code and irrelevant advice.
+            let preflight = normalize::normalize(raw.trim(), &normalize::NormMap::new());
+            normalize::validate_query_length(&preflight)?;
+            let conn = open_ensured(data_dir, offline)?;
             let limit = if all { None } else { Some(limit_flag) };
-            let out = compute_output(&conn, &raw, langs.as_deref(), top, limit, json)?;
+            let out = compute_search(
+                &conn,
+                &search::SearchRequest {
+                    raw: &raw,
+                    langs: langs.as_deref(),
+                    top,
+                    limit,
+                    from: from.as_deref(),
+                    no_split,
+                },
+                json,
+            )?;
             println!("{out}");
             Ok(0)
         }
@@ -245,13 +290,16 @@ pub fn run() -> Result<i32> {
             data_dir,
             offline,
         } => {
-            let conn = open_ensured(data_dir, offline)?;
             let langs: Option<Vec<String>> = lang.map(|l| {
                 l.split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect()
             });
+            if let Some(code) = validate_langs_arg(langs.as_deref()) {
+                return Ok(code);
+            }
+            let conn = open_ensured(data_dir, offline)?;
             let groups_all = query::by_cbeta(&conn, cbeta_id.trim(), juan, langs.as_deref(), top)?;
             let total = groups_all.len();
             if total == 0 && !json {
@@ -274,6 +322,19 @@ pub fn run() -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// 校验 `--lang` 语种代码列表;未传则视为通过。
+///
+/// 非法代码时打印错误到 stderr 并返回应提前退出的状态码,调用方需
+/// `return Ok(code)`。
+fn validate_langs_arg(langs: Option<&[String]>) -> Option<i32> {
+    let codes = langs?;
+    if let Err(e) = lang::validate_langs(codes) {
+        eprintln!("{e}");
+        return Some(2);
+    }
+    None
 }
 
 /// Resolve the data path, ensure the dataset is present (downloading unless
