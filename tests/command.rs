@@ -700,15 +700,16 @@ fn parallel_does_not_build_the_cite_index() {
     );
 }
 
-    // Verifies the earliest fallback path: data directory not writable,
-    // no pre-existing lock file. The operation_lock::try_acquire fails at
-    // lock-file creation (needs directory write access) and returns early,
-    // before reaching index building or stderr announcement. Because this
-    // path exits so early, the stderr and index assertions are trivially
-    // true by construction — this test cannot distinguish between graceful
-    // degradation and absent wiring. The tests that pin down the wiring
-    // are cite_builds_the_missing_index_and_output_is_unchanged and
-    // a_held_lock_skips_the_build_and_leaves_results_identical.
+// Verifies the earliest fallback path: data directory not writable, no
+// pre-existing lock file. `operation_lock::try_acquire` fails at lock-file
+// creation (which needs directory write access) and returns early, before
+// reaching the read-write open, the announcement, or the index build.
+//
+// Because that path exits so early, the stderr and index assertions below are
+// trivially true by construction: this test CANNOT distinguish graceful
+// degradation from the wiring being absent altogether. The tests that do pin
+// the wiring down are `cite_builds_the_missing_index_and_output_is_unchanged`
+// and `a_held_lock_skips_the_build_and_leaves_results_identical`.
 #[cfg(unix)]
 #[test]
 fn cite_degrades_gracefully_when_the_data_dir_is_read_only() {
