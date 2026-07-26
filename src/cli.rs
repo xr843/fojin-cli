@@ -300,6 +300,7 @@ pub fn run() -> Result<i32> {
                 return Ok(code);
             }
             let conn = open_ensured(data_dir, offline)?;
+            data::ensure_cbeta_index(&conn);
             let groups_all = query::by_cbeta(&conn, cbeta_id.trim(), juan, langs.as_deref(), top)?;
             let total = groups_all.len();
             if total == 0 && !json {

@@ -555,3 +555,172 @@ fn reverse_lookup_finds_chinese_from_sanskrit() {
     assert_eq!(v["matched"], serde_json::json!(true));
     assert_eq!(v["groups"][0]["zh_text"], serde_json::json!("色即是空"));
 }
+
+fn write_cite_fixture(dir: &std::path::Path) {
+    let db_path = dir.join("data.sqlite");
+    let conn = Connection::open(db_path).unwrap();
+    init_schema(&conn).unwrap();
+    for (k, v) in [("version", "v1"), ("norm_ruleset", "t2s-char-1to1-v1")] {
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES (?1,?2)",
+            rusqlite::params![k, v],
+        )
+        .unwrap();
+    }
+    for (zt, zn, lang, f, juan) in [
+        ("色即是空", "色即是空", "sa", "rūpaṃ śūnyatā", 1),
+        ("受想行識", "受想行识", "bo", "gzugs stong pa", 2),
+    ] {
+        conn.execute(
+            "INSERT INTO parallels(zh_text,zh_norm,foreign_lang,foreign_text,confidence,cbeta_id,title_zh,juan_num)
+             VALUES (?1,?2,?3,?4,0.9,'T0251','心經',?5)",
+            rusqlite::params![zt, zn, lang, f, juan],
+        )
+        .unwrap();
+    }
+}
+
+fn index_exists(dir: &std::path::Path) -> bool {
+    let conn = Connection::open(dir.join("data.sqlite")).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_parallels_cbeta'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap()
+        > 0
+}
+
+#[test]
+fn cite_builds_the_missing_index_and_output_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    write_cite_fixture(dir.path());
+    assert!(
+        !index_exists(dir.path()),
+        "fixture must start without the index"
+    );
+
+    let first = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["cite", "T0251", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(0));
+    assert!(index_exists(dir.path()), "cite must have built the index");
+
+    // Second run: index already present, so no rebuild and no notice. This is
+    // also the idempotency check — `ensure_cbeta_index` returns before it even
+    // opens the file read-write once the index exists.
+    let second = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["cite", "T0251", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(first.stdout).unwrap(),
+        String::from_utf8(second.stdout).unwrap()
+    );
+    assert!(
+        !String::from_utf8(second.stderr)
+            .unwrap()
+            .contains("建立索引"),
+        "the notice must appear only when actually building"
+    );
+}
+
+#[test]
+fn a_held_lock_skips_the_build_and_leaves_results_identical() {
+    // Holding the operation lock forces `cite` down the un-indexed path, which
+    // is the only portable way to compare indexed vs un-indexed output — the
+    // first run of the previous test already has the index by the time it
+    // queries, so it cannot make this comparison.
+    let indexed_dir = tempfile::tempdir().unwrap();
+    write_cite_fixture(indexed_dir.path());
+    let indexed = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["cite", "T0251", "--offline", "--data-dir"])
+        .arg(indexed_dir.path())
+        .output()
+        .unwrap();
+    assert!(index_exists(indexed_dir.path()));
+
+    let plain_dir = tempfile::tempdir().unwrap();
+    write_cite_fixture(plain_dir.path());
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(plain_dir.path().join("data.sqlite.lock"))
+        .unwrap();
+    lock_file.try_lock().expect("test must own the lock");
+
+    let plain = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["cite", "T0251", "--offline", "--data-dir"])
+        .arg(plain_dir.path())
+        .output()
+        .unwrap();
+    drop(lock_file);
+
+    assert_eq!(
+        plain.status.code(),
+        Some(0),
+        "a busy lock must not fail the query"
+    );
+    assert!(
+        !index_exists(plain_dir.path()),
+        "a busy lock must skip the build rather than wait for it"
+    );
+    assert_eq!(
+        String::from_utf8(indexed.stdout).unwrap(),
+        String::from_utf8(plain.stdout).unwrap(),
+        "the index changes speed only — never results"
+    );
+}
+
+#[test]
+fn parallel_does_not_build_the_cite_index() {
+    let dir = tempfile::tempdir().unwrap();
+    write_cite_fixture(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["parallel", "色即是空", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        !index_exists(dir.path()),
+        "only the cite path needs this index; parallel must not pay for it"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cite_degrades_gracefully_when_the_data_dir_is_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_cite_fixture(dir.path());
+    let original = std::fs::metadata(dir.path()).unwrap().permissions();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fojin"))
+        .args(["cite", "T0251", "--offline", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    // Restore before asserting so a failure still leaves a removable tempdir.
+    std::fs::set_permissions(dir.path(), original).unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a read-only data dir must not fail the query: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("色即是空"));
+}

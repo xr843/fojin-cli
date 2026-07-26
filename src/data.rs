@@ -13,6 +13,71 @@ static REPLACEMENT_BACKUP_SEQUENCE: std::sync::atomic::AtomicU64 =
 pub const EXPECTED_DATA_VERSION: &str = "v1";
 pub const EXPECTED_NORM_RULESET: &str = "t2s-char-1to1-v1";
 
+/// Name of the local `cite` index. Public so tests and diagnostics can look it
+/// up by the same string the builder uses.
+pub const CBETA_INDEX_NAME: &str = "idx_parallels_cbeta";
+
+/// `cite` filters on `cbeta_id = ?1 COLLATE NOCASE` and orders by
+/// `juan_num, id`. The NOCASE collation on the leading column is required:
+/// a BINARY index cannot serve that comparison as an equality seek and
+/// degrades to an index scan.
+///
+/// Deliberately NOT in `schema.sql`: that file is the compatibility reference
+/// (`validate_compatibility` checks against it) and is executed verbatim by
+/// the Python export pipeline. Every already-downloaded dataset lacks this
+/// index and must stay fully valid, so it can never be a compatibility
+/// requirement.
+const CBETA_INDEX_DDL: &str = "CREATE INDEX IF NOT EXISTS idx_parallels_cbeta \
+     ON parallels(cbeta_id COLLATE NOCASE, juan_num, id)";
+
+fn create_cbeta_index(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(CBETA_INDEX_DDL)
+}
+
+fn cbeta_index_exists(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [CBETA_INDEX_NAME],
+        |_| Ok(true),
+    )
+    .optional()
+    .map(|found| found.unwrap_or(false))
+}
+
+/// Best-effort local optimization for `cite`. Without this index the query
+/// scans all 908,620 rows; with it, SQLite seeks directly.
+///
+/// Every failure degrades to that scan: a read-only filesystem, a busy data
+/// operation, or any SQLite error leaves the query correct and merely slower.
+/// Nothing here can fail the caller.
+pub fn ensure_cbeta_index(conn: &rusqlite::Connection) {
+    let Some(path) = conn.path().map(PathBuf::from) else {
+        return; // no backing file (in-memory)
+    };
+    if path.as_os_str().is_empty() {
+        return; // rusqlite returns `Some("")` for a temporary/in-memory database
+    }
+    // On a read error, assume present rather than risk a pointless rebuild.
+    if cbeta_index_exists(conn).unwrap_or(true) {
+        return;
+    }
+    // Never wait: a background `data update`/`clean` means we simply scan.
+    let Ok(_lock) = operation_lock::try_acquire(&path) else {
+        return;
+    };
+    // Open read-write BEFORE announcing. Opening is the only reliable
+    // writability signal — SQLite needs the containing directory writable for
+    // its rollback journal, which file permissions alone do not tell us — and
+    // doing it first keeps a read-only install completely silent.
+    let Ok(writable) =
+        rusqlite::Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+    else {
+        return;
+    };
+    eprintln!("首次按经号查询,正在建立索引(一次性,约 1-2 秒,数据目录约 +17 MB)...");
+    let _ = create_cbeta_index(&writable);
+}
+
 pub struct DataSource<'a> {
     pub url: &'a str,
     pub sha256: &'a str,

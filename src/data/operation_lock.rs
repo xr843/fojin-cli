@@ -27,7 +27,6 @@ fn open_lock_file(data_path: &Path) -> Result<(File, PathBuf)> {
 /// Single attempt, no waiting and no stderr output. The query path uses this:
 /// a user running `cite` should never block on a background data operation,
 /// nor see a message about one.
-#[allow(dead_code)]
 pub(super) fn try_acquire(data_path: &Path) -> Result<OperationLock> {
     let (file, lock_path) = open_lock_file(data_path)?;
     match file.try_lock() {
