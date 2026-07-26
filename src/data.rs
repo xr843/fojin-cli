@@ -13,6 +13,91 @@ static REPLACEMENT_BACKUP_SEQUENCE: std::sync::atomic::AtomicU64 =
 pub const EXPECTED_DATA_VERSION: &str = "v1";
 pub const EXPECTED_NORM_RULESET: &str = "t2s-char-1to1-v1";
 
+/// Single source of truth for the index name. A macro rather than a `const`
+/// because `concat!` needs literals: this is what lets `CBETA_INDEX_DDL` and
+/// `CBETA_INDEX_NAME` below be built from the same token, so they cannot
+/// drift apart. If they ever did, `CREATE INDEX IF NOT EXISTS` would keep
+/// returning `Ok` while `cbeta_index_exists` kept returning `false`, and every
+/// single `cite` would take the lock, open read-write and print the notice
+/// without building anything — the leak commit `be07b85` fixed, re-armed.
+macro_rules! cbeta_index_name {
+    () => {
+        "idx_parallels_cbeta"
+    };
+}
+
+/// Name of the local `cite` index. Public so tests and diagnostics can look it
+/// up by the same string the builder uses.
+pub const CBETA_INDEX_NAME: &str = cbeta_index_name!();
+
+/// `cite` filters on `cbeta_id = ?1 COLLATE NOCASE` and orders by
+/// `juan_num, id`. The NOCASE collation on the leading column is required:
+/// a BINARY index cannot serve that comparison as an equality seek and
+/// degrades to an index scan.
+///
+/// Deliberately NOT in `schema.sql`: that file is the compatibility reference
+/// (`validate_compatibility` checks against it) and is executed verbatim by
+/// the Python export pipeline. Every already-downloaded dataset lacks this
+/// index and must stay fully valid, so it can never be a compatibility
+/// requirement.
+const CBETA_INDEX_DDL: &str = concat!(
+    "CREATE INDEX IF NOT EXISTS ",
+    cbeta_index_name!(),
+    " ON parallels(cbeta_id COLLATE NOCASE, juan_num, id)"
+);
+
+fn create_cbeta_index(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(CBETA_INDEX_DDL)
+}
+
+fn cbeta_index_exists(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [CBETA_INDEX_NAME],
+        |_| Ok(true),
+    )
+    .optional()
+    .map(|found| found.unwrap_or(false))
+}
+
+/// Best-effort local optimization for `cite`. Without this index the query
+/// scans all 908,620 rows; with it, SQLite seeks directly.
+///
+/// Every failure degrades to that scan: a read-only filesystem, a busy data
+/// operation, or any SQLite error leaves the query correct and merely slower.
+/// Nothing here can fail the caller.
+pub fn ensure_cbeta_index(conn: &rusqlite::Connection) {
+    let Some(path) = conn.path().map(PathBuf::from) else {
+        return; // no backing file (in-memory)
+    };
+    if path.as_os_str().is_empty() {
+        return; // rusqlite returns `Some("")` for a temporary/in-memory database
+    }
+    // On a read error, assume present rather than risk a pointless rebuild.
+    if cbeta_index_exists(conn).unwrap_or(true) {
+        return;
+    }
+    // Never wait: a background `data update`/`clean` means we simply scan.
+    let Ok(_lock) = operation_lock::try_acquire(&path) else {
+        return;
+    };
+    // Writability cannot be reliably predicted before we actually try to
+    // write: SQLite defers creating its rollback journal until the write
+    // itself, so a successful read-write `open` (and even a `SELECT`) tells
+    // us nothing — a directory that forbids new files will still let an
+    // existing, writable database file open cleanly. So we don't announce
+    // anything up front; we only report the build after `CREATE INDEX` has
+    // actually succeeded.
+    let Ok(writable) =
+        rusqlite::Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+    else {
+        return;
+    };
+    if create_cbeta_index(&writable).is_ok() {
+        eprintln!("已为按经号查询建立索引(一次性,数据目录增加约 17 MB)。");
+    }
+}
+
 pub struct DataSource<'a> {
     pub url: &'a str,
     pub sha256: &'a str,
@@ -145,12 +230,28 @@ pub fn clean_data(path: &Path) -> Result<Option<u64>> {
     if size.is_some() {
         std::fs::remove_file(path).with_context(|| format!("删除数据失败: {}", path.display()))?;
     }
+    // The database this journal belonged to is gone, so the journal is now
+    // meaningless — and actively harmful: left behind, it would be replayed
+    // into whatever gets downloaded next. Main file first, sidecars second:
+    // the reverse order would, if interrupted, leave a half-written database
+    // with no journal left to repair it.
+    transfer::remove_sqlite_sidecars(path)?;
     Ok(size)
 }
 
 fn install_candidate(path: &Path, source: &DataSource<'_>) -> Result<()> {
     let candidate = transfer::stage_candidate(path, source, transfer::PRODUCTION_POLICY)?;
     if let Err(error) = verify_dataset_file(candidate.path()).map(|_| ()) {
+        return Err(candidate.cleanup_with(error));
+    }
+    // Build the cite index on the candidate so a fresh install never has to
+    // take the lazy path. ~1.6 s against a 183 MB download.
+    if let Err(error) =
+        rusqlite::Connection::open_with_flags(candidate.path(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(anyhow::Error::from)
+            .and_then(|conn| create_cbeta_index(&conn).map_err(anyhow::Error::from))
+            .with_context(|| format!("为候选数据建立索引失败: {}", candidate.path().display()))
+    {
         return Err(candidate.cleanup_with(error));
     }
     if let Err(error) = std::fs::OpenOptions::new()
@@ -162,8 +263,28 @@ fn install_candidate(path: &Path, source: &DataSource<'_>) -> Result<()> {
     {
         return Err(candidate.cleanup_with(error));
     }
+    // The replace only renames the main file, so any journal sitting next to
+    // the live path would survive it and be replayed into the brand-new
+    // database (`database disk image is malformed` on the first read-write
+    // open). Clearing it here is safe precisely because the old database is
+    // about to be replaced wholesale, and because `operation_lock` is held
+    // for the whole function, excluding concurrent fojin data operations.
+    //
+    // One caveat this rationale does not cover on its own: if the replace
+    // below then fails, we have discarded a journal that `open_read_only_db`
+    // could otherwise have rolled back, turning a recoverable dataset into an
+    // unrecoverable one. Accepted, and bounded — the file is a re-downloadable
+    // cache, and the remedy is re-running the command that just failed.
+    if let Err(error) = transfer::remove_sqlite_sidecars(path) {
+        return Err(candidate.cleanup_with(error));
+    }
     let candidate_path = candidate.path().to_path_buf();
-    finish_replacement(candidate, replace_with_candidate(path, &candidate_path))
+    finish_replacement(candidate, replace_with_candidate(path, &candidate_path))?;
+    // And again afterwards, so what gets published is always "new database,
+    // no foreign journal" — whatever appeared during the replacement window
+    // belongs to the database that just went away. Failing here is louder
+    // than leaving the freshly installed dataset next to a live landmine.
+    transfer::remove_sqlite_sidecars(path)
 }
 
 fn sibling_path(path: &Path, suffix: &str) -> Result<PathBuf> {
@@ -572,9 +693,110 @@ pub fn open_db(path: &Path) -> Result<rusqlite::Connection> {
     rusqlite::Connection::open(path).with_context(|| format!("打开数据失败: {}", path.display()))
 }
 
-pub fn open_read_only_db(path: &Path) -> Result<rusqlite::Connection> {
+fn open_read_only_connection(path: &Path) -> Result<rusqlite::Connection> {
     rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("打开数据失败: {}", path.display()))
+}
+
+/// Force SQLite to actually touch the file. Opening is lazy: a hot rollback
+/// journal is only discovered when the pager takes its first SHARED lock and
+/// reads page 1, which is why the failure used to surface far from here — in
+/// `require_schema`'s first `prepare`.
+fn probe_first_read(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+}
+
+/// A read attempt blocked by a hot rollback journal: the database was left
+/// mid-write (an interrupted `CREATE INDEX`, `data update`, power loss…) and
+/// rolling that journal back needs write access, which a read-only connection
+/// does not have. SQLite reports `SQLITE_READONLY_ROLLBACK`.
+///
+/// Only ever consult this on a *read*: a genuine write against a read-only
+/// connection carries the same "attempt to write a readonly database" text
+/// under the plain `SQLITE_READONLY` code, and that one is not a hot journal.
+fn is_hot_journal_error(error: &rusqlite::Error) -> bool {
+    let rusqlite::Error::SqliteFailure(failure, message) = error else {
+        return false;
+    };
+    failure.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK
+        || message
+            .as_deref()
+            .is_some_and(|text| text.contains("attempt to write a readonly database"))
+}
+
+/// Let SQLite roll a hot journal back by itself.
+///
+/// The whole discrimination between "interrupted write on a writable dataset"
+/// and "genuinely read-only install" is this reopen with
+/// `SQLITE_OPEN_READ_WRITE` (deliberately *without* `CREATE`, so self-healing
+/// can never conjure an empty database) followed by a real read:
+///
+/// * Writable dataset: the reopen succeeds and the first read takes an
+///   EXCLUSIVE lock, replays the journal, deletes it — the file is back to its
+///   pre-interruption state and the caller's re-opened read-only connection
+///   simply works.
+/// * Read-only file: the kernel refuses `O_RDWR`, and SQLite *silently*
+///   downgrades the open to read-only, so the read fails with
+///   `SQLITE_READONLY_ROLLBACK` again.
+/// * Read-only directory (writable file): SQLite replays the journal but
+///   cannot unlink it, so the read fails with `SQLITE_IOERR_DELETE` and the
+///   journal stays hot.
+///
+/// Either failure path falls back to the pre-existing error. Neither damages
+/// anything: the read-only file is left byte-identical, and the read-only
+/// directory is left holding a *replayed* — that is, restored — database
+/// whose journal simply gets replayed again, idempotently, next time.
+///
+/// This never deletes a file. Rolling back is SQLite's job: removing a journal
+/// by hand would destroy the in-flight transaction of whatever process wrote
+/// it and freeze the database half-written.
+///
+/// Nor can this fire against a live transaction: a journal whose writer still
+/// holds a RESERVED lock is by definition *not* hot, so a concurrent fojin
+/// index build never even reaches here — that case reports `SQLITE_BUSY`,
+/// which is not the signature we act on.
+fn rollback_hot_journal(path: &Path) {
+    let Ok(conn) = rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+    else {
+        return;
+    };
+    let _ = probe_first_read(&conn);
+}
+
+pub fn open_read_only_db(path: &Path) -> Result<rusqlite::Connection> {
+    let conn = open_read_only_connection(path)?;
+    match probe_first_read(&conn) {
+        Err(error) if is_hot_journal_error(&error) => {
+            // Drop the SHARED lock first: the rollback needs EXCLUSIVE.
+            drop(conn);
+            rollback_hot_journal(path);
+            // Healed, the fresh connection reads fine. Not healed, nothing on
+            // disk changed and it fails exactly where it failed before — see
+            // the hot-journal branch of `require_schema`.
+            open_read_only_connection(path)
+        }
+        // Anything else (including "file is not a database") is left to the
+        // caller's existing checks, so no error text moves for it.
+        _ => Ok(conn),
+    }
+}
+
+/// Wording for the state a hot journal actually leaves the CLI in.
+///
+/// It is *not* a dataset incompatibility, and `fojin data update` cannot fix
+/// it: the atomic replace only renames the main file, so the stale journal
+/// stays exactly where it was and takes the freshly downloaded database down
+/// with it. Reaching this point also means self-healing already tried and
+/// failed, so the only real cause left is that the dataset cannot be written.
+fn hot_journal_error(conn: &rusqlite::Connection) -> anyhow::Error {
+    let data = conn.path().unwrap_or("data.sqlite");
+    anyhow!(
+        "上次写入数据时被中断,`{data}` 旁留下了一份未回滚的日志(`{data}-journal`)。\
+         回滚这份日志需要写权限,而当前数据不可写,因此无法自动修复 \
+         —— 数据本身没有损坏,也不需要重新下载。\
+         请恢复该数据文件及其所在目录的写权限后重新运行(届时会自动回滚),\
+         或改用一个可写的 `--data-dir`。"
+    )
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -727,6 +949,13 @@ pub fn dataset_stats(conn: &rusqlite::Connection) -> Result<DatasetStats> {
 
 fn require_schema(conn: &rusqlite::Connection, name: &str, sql: &str) -> Result<()> {
     conn.prepare(sql).map(|_| ()).map_err(|e| {
+        // A hot journal blocks *every* read, so it always lands on this first
+        // check of `validate_compatibility` — this is the single funnel where
+        // it can surface, and calling it an incompatibility was wrong twice
+        // over: wrong diagnosis, and advice that cannot work.
+        if is_hot_journal_error(&e) {
+            return hot_journal_error(conn);
+        }
         anyhow!(
             "dataset incompatibility: required schema `{name}` is missing or invalid: {e}. Run `fojin data update`."
         )

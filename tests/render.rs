@@ -272,3 +272,114 @@ fn json_segments_appear_only_when_splitting_happened() {
     );
     assert!(v.get("fallback").is_none());
 }
+
+#[test]
+fn perfect_confidence_shows_no_tag() {
+    let group = MatchGroup {
+        zh_text: "色即是空".into(),
+        cbeta_id: Some("T0251".into()),
+        title_zh: Some("心經".into()),
+        juan_num: Some(1),
+        parallels: vec![Parallel {
+            lang: "sa".into(),
+            text: "rūpaṃ śūnyatā".into(),
+            confidence: Some(1.0),
+        }],
+    };
+    let out = render_human(&[group], None, 0);
+    assert!(
+        out.contains("梵  rūpaṃ śūnyatā"),
+        "the parallel itself stays: {out}"
+    );
+    assert!(
+        !out.contains("MITRA"),
+        "a uniform 1.00 carries no information and must not be printed: {out}"
+    );
+}
+
+#[test]
+fn imperfect_confidence_still_shows_the_tag() {
+    let group = MatchGroup {
+        zh_text: "色即是空".into(),
+        cbeta_id: Some("T0251".into()),
+        title_zh: Some("心經".into()),
+        juan_num: Some(1),
+        parallels: vec![Parallel {
+            lang: "sa".into(),
+            text: "rūpaṃ śūnyatā".into(),
+            confidence: Some(0.87),
+        }],
+    };
+    let out = render_human(&[group], None, 0);
+    assert!(
+        out.contains("梵  rūpaṃ śūnyatā  [MITRA 0.87]"),
+        "got: {out}"
+    );
+}
+
+#[test]
+fn confidence_rounding_to_one_hides_the_tag() {
+    // 0.9951 formats as "1.00"; printing `[MITRA 1.00]` while calling the value
+    // informative would contradict itself, so the rule keys on what would be
+    // displayed, not on the raw float.
+    let group = MatchGroup {
+        zh_text: "色即是空".into(),
+        cbeta_id: Some("T0251".into()),
+        title_zh: Some("心經".into()),
+        juan_num: Some(1),
+        parallels: vec![Parallel {
+            lang: "sa".into(),
+            text: "rūpaṃ śūnyatā".into(),
+            confidence: Some(0.9951),
+        }],
+    };
+    let out = render_human(&[group], None, 0);
+    assert!(
+        out.contains("梵  rūpaṃ śūnyatā"),
+        "the parallel itself stays: {out}"
+    );
+    assert!(!out.contains("MITRA"), "got: {out}");
+}
+
+#[test]
+fn absent_confidence_shows_no_tag() {
+    let group = MatchGroup {
+        zh_text: "色即是空".into(),
+        cbeta_id: Some("T0251".into()),
+        title_zh: Some("心經".into()),
+        juan_num: Some(1),
+        parallels: vec![Parallel {
+            lang: "sa".into(),
+            text: "rūpaṃ śūnyatā".into(),
+            confidence: None,
+        }],
+    };
+    let out = render_human(&[group], None, 0);
+    assert!(
+        out.contains("梵  rūpaṃ śūnyatā"),
+        "the parallel itself stays: {out}"
+    );
+    assert!(!out.contains("MITRA"), "got: {out}");
+}
+
+#[test]
+fn json_still_carries_confidence_when_the_tag_is_hidden() {
+    let group = MatchGroup {
+        zh_text: "色即是空".into(),
+        cbeta_id: Some("T0251".into()),
+        title_zh: Some("心經".into()),
+        juan_num: Some(1),
+        parallels: vec![Parallel {
+            lang: "sa".into(),
+            text: "rūpaṃ śūnyatā".into(),
+            confidence: Some(1.0),
+        }],
+    };
+    let out = render_json(&[group], 1);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["groups"][0]["parallels"][0]["confidence"],
+        serde_json::json!(1.0),
+        "the JSON contract is unchanged; only the human tag is suppressed"
+    );
+}

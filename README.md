@@ -12,8 +12,8 @@
 ```
 $ fojin parallel "色即是空"
 汉  色不異空，空不異色，色即是空，空即是色；  (《般若波羅蜜多心經》T0251 卷1)
-梵  śūnyat'aiva rūpaṃ, rūpān na pṛthak śūnyatā …  [MITRA 1.00]
-藏  གཟུགས་ལས་སྟོང་པ་ཉིད་གཞན་མ་ཡིན༏ …  [MITRA 1.00]
+梵  śūnyat'aiva rūpaṃ, rūpān na pṛthak śūnyatā …
+藏  གཟུགས་ལས་སྟོང་པ་ཉིད་གཞན་མ་ཡིན༏ …
 
 … 还有 38 组匹配,加 --all 查看全部
 
@@ -135,13 +135,18 @@ fojin parallel "色即是空" --json
 fojin texts "心经"        # 模糊查经名(简繁均可) → Taishō 编号 + 各语对齐条数
 fojin cite T0251          # 按编号列出一部经的对齐,经文顺序;--juan N 限定卷
 fojin data status         # 本地数据状态(位置/大小/版本/行数统计)
-fojin data clean          # 删除本地数据,释放 561 MB
+fojin data clean          # 删除本地数据,释放 578 MB
 fojin data update         # 重新下载数据(覆盖本地)
 fojin data verify         # 校验版本、SQLite 与 FTS 完整性
 ```
 
 `texts` 与 `cite` 支持与 `parallel` 一致的 `--json` / `--data-dir` / `--offline`;
 `cite` 另有 `--lang` / `--top` / `--limit` / `--all`。典型工作流:`texts` 找到编号 → `cite` 通读对齐。
+
+按经号查询依赖一个本地索引(约 17 MB)。v0.3.0 之后**全新下载**的数据在安装时就已带上它,
+首次 `fojin cite` 不会有额外提示或等待;**升级前已经下载过的数据**则在首次运行 `fojin cite`
+时补建一次(约 1–2 秒,数据目录相应增加约 17 MB),之后按经号查询为毫秒级。
+数据目录不可写时会跳过建索引,查询结果不受影响,只是较慢。
 
 ```
 $ fojin texts "心经" | head -3
@@ -192,9 +197,11 @@ fojin parallel "<汉文短语>" --json --offline
   - 藏 / Tibetan:676,898 条
   - 梵 / Sanskrit:231,722 条
 - 来源:Dharmamitra 的 [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) 对齐数据集([Nehrdich & Keutzer, 2026](https://arxiv.org/pdf/2601.06400)),以 GitHub Release(`data-v1`)形式分发;学术使用请引用原论文(BibTeX 见 [`DATA_LICENSE`](DATA_LICENSE))。
+- 当前数据集(`data-v1`)所有对齐的置信度均为 1.00,不具区分度,因此人类可读输出不再逐行标注;
+  `--json` 的 `confidence` 字段保持输出。未来数据若提供真实分数,低于 1.00 的会自动显示。
 - 当前二进制把官方下载地址、SHA-256 与兼容元数据固定在 `data-v1`;`fojin data update` 只会重新获取这份固定数据,不会自动切换到未来的数据主版本。版本、归一化规则或查询所需 schema 不兼容的数据会被拒绝。
-- 首次运行时下载,压缩包约 **183 MB**,解压后约 **561 MB**(SQLite)。下载后完全离线可用。
-- 安装和更新采用有界的磁盘流式传输,不再在内存中缓冲完整压缩包或数据库;压缩响应上限为 **256 MiB**,解压后的数据库上限为 **768 MiB**。更新期间可能临时需要现用数据库所占空间,外加约 **744 MiB** 暂存磁盘空间(约 183 MiB 压缩包 + 约 561 MiB 候选数据库)。
+- 首次运行时下载,压缩包约 **183 MB**,解压并建好按经号索引后约 **578 MB**(SQLite)。下载后完全离线可用。
+- 安装和更新采用有界的磁盘流式传输,不再在内存中缓冲完整压缩包或数据库;压缩响应上限为 **256 MiB**,解压后的数据库上限为 **768 MiB**。更新期间可能临时需要现用数据库所占空间,外加约 **761 MiB** 暂存磁盘空间(约 183 MiB 压缩包 + 约 578 MiB 候选数据库)。
 - HTTP DNS 解析与连接超时均为 **30 秒**,响应头和响应体的空闲读取超时均为 **60 秒**,并以跨重定向、覆盖 DNS 到响应体读取的 **15 分钟端到端硬时限** 为上限。
 - 同一数据目录上的首次安装、更新和清理操作按 single-flight 串行执行;等待者最多等待 **20 分钟**。永久保留的 `data.sqlite.lock` 文件是无害的协调文件,`fojin data clean` 会有意保留它。
 - 离线查询行为及固定到 `data-v1` 的校验和契约保持不变。
@@ -233,7 +240,7 @@ fojin data verify                 # verify version, SQLite, and FTS integrity
 - **Build/install integrity**: building from crates.io or source requires Rust 1.95+ (MSRV 1.95). Starting with v0.3.0, the shell installer requires the target binary release to provide `SHA256SUMS` and verifies the archive before extraction. It fails closed for an older latest or explicitly selected release without that file, including the transition before v0.3.0 is published; use the currently published crates.io version or a source build instead. This does not state that v0.3.0 has been released.
 - **For AI agents**: pure-JSON stdout, semantic exit codes (`0` ok / `1` runtime / `2` usage), zero network with `--offline`. Ready-made Claude Code integration in [`examples/claude/`](examples/claude/).
 - **Data**: 908,620 zh↔sa/bo alignments from Dharmamitra's [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) dataset, redistributed under CC BY-SA 4.0. The official URL, checksum, and compatibility contract remain pinned to `data-v1`; rendering support for future language rows does not mean the official update channel can adopt them without a binary upgrade. Academic use: please cite [Nehrdich & Keutzer (2026)](https://arxiv.org/pdf/2601.06400) — BibTeX in [`DATA_LICENSE`](DATA_LICENSE).
-- **Data transfer resources**: installs and updates use bounded, disk-streamed transfers and no longer buffer the complete archive or database in memory. Compressed responses are capped at **256 MiB** and decompressed databases at **768 MiB**. An update can temporarily require the live database plus roughly **744 MiB** of staging disk (about 183 MiB for the archive and 561 MiB for the candidate database).
+- **Data transfer resources**: installs and updates use bounded, disk-streamed transfers and no longer buffer the complete archive or database in memory. Compressed responses are capped at **256 MiB** and decompressed databases at **768 MiB**. An update can temporarily require the live database plus roughly **761 MiB** of staging disk (about 183 MiB for the archive and 578 MiB for the candidate database).
 - **Data timeouts**: HTTP DNS resolution and connection timeouts are both **30 seconds**, response-header and response-body idle-read timeouts are both **60 seconds**, and a **15-minute hard end-to-end deadline** spans redirects from DNS through the final body read.
 - **Concurrent data operations**: initial install, update, and clean operations on one data directory are single-flight; a waiter may wait up to **20 minutes**. The permanent `data.sqlite.lock` file is harmless coordination state and intentionally survives `fojin data clean`.
 - **Stable query contract**: offline queries and the checksum contract pinned to `data-v1` are unchanged.
