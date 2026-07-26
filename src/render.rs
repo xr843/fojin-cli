@@ -24,7 +24,7 @@ pub fn lang_label(code: &str) -> &str {
 /// The tag appears only when it would show a number other than 1.00.
 ///
 /// Keying on the formatted string rather than the raw float keeps the rule
-/// self-consistent: a value like 0.995 would render as "1.00", so treating it
+/// self-consistent: a value like 0.9951 would render as "1.00", so treating it
 /// as informative would print a tag that says exactly what we suppress
 /// elsewhere. Absence of the tag reads as "no caveat".
 fn conf_tag(c: Option<f64>) -> String {

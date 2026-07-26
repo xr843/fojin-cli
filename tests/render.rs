@@ -334,6 +334,10 @@ fn confidence_rounding_to_one_hides_the_tag() {
         }],
     };
     let out = render_human(&[group], None, 0);
+    assert!(
+        out.contains("梵  rūpaṃ śūnyatā"),
+        "the parallel itself stays: {out}"
+    );
     assert!(!out.contains("MITRA"), "got: {out}");
 }
 
@@ -351,6 +355,10 @@ fn absent_confidence_shows_no_tag() {
         }],
     };
     let out = render_human(&[group], None, 0);
+    assert!(
+        out.contains("梵  rūpaṃ śūnyatā"),
+        "the parallel itself stays: {out}"
+    );
     assert!(!out.contains("MITRA"), "got: {out}");
 }
 
