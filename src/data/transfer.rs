@@ -10,6 +10,9 @@ use std::time::{Duration, Instant as StdInstant};
 
 const MIB: u64 = 1024 * 1024;
 const BUFFER_SIZE: usize = 64 * 1024;
+/// 边车文件:SQLite 在主数据库旁自己派生的回滚日志与 WAL 组。它们只在
+/// 与那份主文件配对时才有意义,因此永远跟着主文件一起被处置。
+const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-shm", "-wal"];
 static ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug)]
@@ -433,7 +436,7 @@ fn try_create_candidate_artifact_with<F>(
 where
     F: FnMut(&Path) -> Result<bool>,
 {
-    let sidecars = ["-journal", "-shm", "-wal"]
+    let sidecars = SQLITE_SIDECAR_SUFFIXES
         .map(|suffix| sibling_path(path, suffix))
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
@@ -508,7 +511,7 @@ fn path_entry_exists(path: &Path) -> Result<bool> {
 }
 
 fn remove_artifact_family(path: &Path) -> Result<()> {
-    for suffix in ["", "-journal", "-shm", "-wal"] {
+    for suffix in std::iter::once("").chain(SQLITE_SIDECAR_SUFFIXES) {
         let artifact = if suffix.is_empty() {
             path.to_path_buf()
         } else {
@@ -520,6 +523,31 @@ fn remove_artifact_family(path: &Path) -> Result<()> {
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("删除候选数据失败: {}", artifact.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 只删 SQLite 为一个数据库派生的边车,主文件原封不动。
+///
+/// 与 `remove_artifact_family` 是同一套纪律,区别只在于主文件不归它管:
+/// 两个调用点要么正在删除主文件(`clean_data`),要么正要用 rename 覆盖它
+/// (`install_candidate`)。
+///
+/// **只能用在这两处。** 对一个正在使用的数据库删日志,等于摧毁另一个进程
+/// 正在进行的事务,并让数据库永久停在半写状态 —— 查询打开路径上绝不能
+/// 出现这个调用。让路径安全的是这两条:主文件即将消失或被整体替换,以及
+/// 两处都在 `operation_lock` 之下,排除了并发的 fojin 数据操作。
+pub(super) fn remove_sqlite_sidecars(live_path: &Path) -> Result<()> {
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let sidecar = sibling_path(live_path, suffix)?;
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("删除陈旧数据日志失败: {}", sidecar.display()));
             }
         }
     }
@@ -579,7 +607,7 @@ fn is_owned_artifact_name(live_name: &str, artifact_name: &str) -> bool {
     let Some(candidate) = suffix.strip_prefix(".candidate.") else {
         return false;
     };
-    let generation = ["-journal", "-shm", "-wal"]
+    let generation = SQLITE_SIDECAR_SUFFIXES
         .into_iter()
         .find_map(|sidecar| candidate.strip_suffix(sidecar))
         .unwrap_or(candidate);

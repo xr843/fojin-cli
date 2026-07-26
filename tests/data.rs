@@ -181,10 +181,15 @@ fn clean_data_removes_known_file_artifacts_and_preserves_other_entries() {
     let download = sibling_path(&data, ".download.123.0.gz");
     let candidate = sibling_path(&data, ".candidate.123.1");
     let candidate_journal = sibling_path(&data, ".candidate.123.1-journal");
+    // 活跃库自己的边车。被中断的建索引会留下 `-journal`;删掉主库却把它
+    // 留在原地,下一次重新下载的数据会被这份陈旧日志重放成一堆乱码。
+    let live_sidecars = ["-journal", "-shm", "-wal"].map(|suffix| sibling_path(&data, suffix));
     let matching_directory = sibling_path(&data, ".download.keep");
     let lock_path = sibling_path(&data, ".lock");
     let unrelated = sibling_path(&data, ".unrelated");
     let lookalikes = [
+        sibling_path(&data, "-journal.notes"),
+        sibling_path(&data, ".journal"),
         sibling_path(&data, ".candidate.notes"),
         sibling_path(&data, ".candidate.123"),
         sibling_path(&data, ".candidate.123.x"),
@@ -195,7 +200,10 @@ fn clean_data_removes_known_file_artifacts_and_preserves_other_entries() {
         sibling_path(&data, ".download.123.0.gz.notes"),
     ];
     std::fs::write(&data, b"live").unwrap();
-    for artifact in [&legacy, &download, &candidate, &candidate_journal] {
+    for artifact in [&legacy, &download, &candidate, &candidate_journal]
+        .into_iter()
+        .chain(live_sidecars.iter())
+    {
         std::fs::write(artifact, b"temporary").unwrap();
     }
     std::fs::create_dir(&matching_directory).unwrap();
@@ -206,7 +214,10 @@ fn clean_data_removes_known_file_artifacts_and_preserves_other_entries() {
     }
 
     assert_eq!(clean_data(&data).unwrap(), Some(4));
-    for removed in [&data, &legacy, &download, &candidate, &candidate_journal] {
+    for removed in [&data, &legacy, &download, &candidate, &candidate_journal]
+        .into_iter()
+        .chain(live_sidecars.iter())
+    {
         assert!(!removed.exists(), "artifact remains: {}", removed.display());
     }
     assert!(matching_directory.is_dir());
@@ -1293,6 +1304,64 @@ fn update_data_replaces_live_dataset_without_backup_path_dependency() {
     assert_eq!(marker, "replacement");
     assert!(backup_sentinel.is_dir());
     assert_no_candidate_artifacts(&path);
+}
+
+// 被中断的建索引会在活跃路径旁留下一份"热"回滚日志。`install_candidate`
+// 的原子替换只搬主文件,日志会原地不动地等着被重放进那份刚下载的新库 ——
+// 于是用户白下 183 MB,第一次读写打开就把新库改成 `database disk image is
+// malformed`。发布出去的必须是"新库 + 没有任何外来日志"。
+#[test]
+fn update_data_publishes_without_the_previous_datasets_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    std::fs::write(&path, b"old live dataset").unwrap();
+    let journal = sibling_path(&path, "-journal");
+    std::fs::write(&journal, foreign_hot_journal_bytes()).unwrap();
+
+    let gz = gzip_bytes(&replacement_database_bytes());
+    let sha = sha256_hex(&gz);
+    serve_update(&path, gz, &sha).unwrap();
+
+    assert!(
+        !journal.exists(),
+        "the replaced dataset's journal must not survive the publish: {}",
+        journal.display()
+    );
+    assert_replacement_marker(&path);
+    assert_no_candidate_artifacts(&path);
+}
+
+/// 一份来自**另一个**数据库、且仍然有效("热")的回滚日志的字节。
+///
+/// 触发点是页缓存溢出:缓存放不下时 SQLite 必须先把日志(含 magic 头)
+/// 同步落盘才能把脏页写回主库,日志由此变"热"。事务既不提交也不回滚,
+/// 读出来的就是进程猝死在该窗口时留在磁盘上的字节。
+fn foreign_hot_journal_bytes() -> Vec<u8> {
+    const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("interrupted.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    fojin_cli::schema::init_schema(&conn).unwrap();
+    insert_compat_meta(&conn);
+    conn.pragma_update(None, "cache_size", 10_i64).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    for index in 0..2000 {
+        conn.execute(
+            "INSERT INTO parallels(zh_text, zh_norm, foreign_lang, foreign_text) \
+             VALUES (?1, ?1, 'sa', 'x')",
+            rusqlite::params![format!("未提交的垃圾行{index}")],
+        )
+        .unwrap();
+    }
+    let bytes = std::fs::read(sibling_path(&path, "-journal")).unwrap();
+    drop(conn);
+
+    assert!(
+        bytes.starts_with(&JOURNAL_MAGIC),
+        "the fixture must be a journal SQLite would actually replay"
+    );
+    bytes
 }
 
 fn replacement_database_bytes() -> Vec<u8> {
