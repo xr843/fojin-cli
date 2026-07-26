@@ -269,6 +269,12 @@ fn install_candidate(path: &Path, source: &DataSource<'_>) -> Result<()> {
     // open). Clearing it here is safe precisely because the old database is
     // about to be replaced wholesale, and because `operation_lock` is held
     // for the whole function, excluding concurrent fojin data operations.
+    //
+    // One caveat this rationale does not cover on its own: if the replace
+    // below then fails, we have discarded a journal that `open_read_only_db`
+    // could otherwise have rolled back, turning a recoverable dataset into an
+    // unrecoverable one. Accepted, and bounded — the file is a re-downloadable
+    // cache, and the remedy is re-running the command that just failed.
     if let Err(error) = transfer::remove_sqlite_sidecars(path) {
         return Err(candidate.cleanup_with(error));
     }
