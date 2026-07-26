@@ -1,7 +1,7 @@
 use fojin_cli::data::{
     clean_data, ensure_data, gunzip, open_compatible_db, open_read_only_db, resolve_data_path,
     update_data, validate_compatibility, verify_dataset, verify_dataset_file, verify_sha256,
-    DataSource, EXPECTED_DATA_VERSION, EXPECTED_NORM_RULESET,
+    DataSource, CBETA_INDEX_NAME, EXPECTED_DATA_VERSION, EXPECTED_NORM_RULESET,
 };
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -311,6 +311,49 @@ fn ensure_data_downloads_verifies_and_unpacks() {
     ensure_data(&path, false, &source).unwrap();
     server.join().unwrap();
 
+    verify_dataset_file(&path).unwrap();
+}
+
+#[test]
+fn install_leaves_the_cite_index_in_place() {
+    let gz = gzip_bytes(&replacement_database_bytes());
+    let sha = sha256_hex(&gz);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = gz.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut req = [0u8; 4096];
+        let _ = std::io::Read::read(&mut stream, &mut req);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/gzip\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.sqlite");
+    let source = DataSource {
+        url: &format!("http://127.0.0.1:{port}/data.gz"),
+        sha256: &sha,
+    };
+    ensure_data(&path, false, &source).unwrap();
+    server.join().unwrap();
+
+    let conn = open_read_only_db(&path).unwrap();
+    let present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+            [CBETA_INDEX_NAME],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(present, 1, "a fresh install must ship the cite index");
+
+    // The index must not disturb the compatibility contract.
     verify_dataset_file(&path).unwrap();
 }
 
