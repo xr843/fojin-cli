@@ -21,8 +21,24 @@ pub fn lang_label(code: &str) -> &str {
     }
 }
 
+/// The tag appears only when it would show a number other than 1.00.
+///
+/// Keying on the formatted string rather than the raw float keeps the rule
+/// self-consistent: a value like 0.995 would render as "1.00", so treating it
+/// as informative would print a tag that says exactly what we suppress
+/// elsewhere. Absence of the tag reads as "no caveat".
 fn conf_tag(c: Option<f64>) -> String {
-    c.map(|v| format!("  [MITRA {v:.2}]")).unwrap_or_default()
+    match c {
+        Some(v) => {
+            let shown = format!("{v:.2}");
+            if shown == "1.00" {
+                String::new()
+            } else {
+                format!("  [MITRA {shown}]")
+            }
+        }
+        None => String::new(),
+    }
 }
 
 /// Renders groups only — no footer, no "还有 N 组" line. Shared by the plain
