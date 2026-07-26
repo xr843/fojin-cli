@@ -12,8 +12,8 @@
 ```
 $ fojin parallel "色即是空"
 汉  色不異空，空不異色，色即是空，空即是色；  (《般若波羅蜜多心經》T0251 卷1)
-梵  śūnyat'aiva rūpaṃ, rūpān na pṛthak śūnyatā …  [MITRA 1.00]
-藏  གཟུགས་ལས་སྟོང་པ་ཉིད་གཞན་མ་ཡིན༏ …  [MITRA 1.00]
+梵  śūnyat'aiva rūpaṃ, rūpān na pṛthak śūnyatā …
+藏  གཟུགས་ལས་སྟོང་པ་ཉིད་གཞན་མ་ཡིན༏ …
 
 … 还有 38 组匹配,加 --all 查看全部
 
@@ -143,6 +143,9 @@ fojin data verify         # 校验版本、SQLite 与 FTS 完整性
 `texts` 与 `cite` 支持与 `parallel` 一致的 `--json` / `--data-dir` / `--offline`;
 `cite` 另有 `--lang` / `--top` / `--limit` / `--all`。典型工作流:`texts` 找到编号 → `cite` 通读对齐。
 
+首次运行 `fojin cite` 会为按经号查询建立一次本地索引(约 1–2 秒,数据目录增加约 17 MB),
+之后按经号查询为毫秒级。数据目录不可写时会跳过建索引,查询结果不受影响,只是较慢。
+
 ```
 $ fojin texts "心经" | head -3
 T0249  佛說帝釋般若波羅蜜多心經  (藏 50 · 梵 25)
@@ -192,6 +195,8 @@ fojin parallel "<汉文短语>" --json --offline
   - 藏 / Tibetan:676,898 条
   - 梵 / Sanskrit:231,722 条
 - 来源:Dharmamitra 的 [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) 对齐数据集([Nehrdich & Keutzer, 2026](https://arxiv.org/pdf/2601.06400)),以 GitHub Release(`data-v1`)形式分发;学术使用请引用原论文(BibTeX 见 [`DATA_LICENSE`](DATA_LICENSE))。
+- 当前数据集(`data-v1`)所有对齐的置信度均为 1.00,不具区分度,因此人类可读输出不再逐行标注;
+  `--json` 的 `confidence` 字段保持输出。未来数据若提供真实分数,低于 1.00 的会自动显示。
 - 当前二进制把官方下载地址、SHA-256 与兼容元数据固定在 `data-v1`;`fojin data update` 只会重新获取这份固定数据,不会自动切换到未来的数据主版本。版本、归一化规则或查询所需 schema 不兼容的数据会被拒绝。
 - 首次运行时下载,压缩包约 **183 MB**,解压后约 **561 MB**(SQLite)。下载后完全离线可用。
 - 安装和更新采用有界的磁盘流式传输,不再在内存中缓冲完整压缩包或数据库;压缩响应上限为 **256 MiB**,解压后的数据库上限为 **768 MiB**。更新期间可能临时需要现用数据库所占空间,外加约 **744 MiB** 暂存磁盘空间(约 183 MiB 压缩包 + 约 561 MiB 候选数据库)。

@@ -14,5 +14,7 @@ Version 0.3.0 is prepared but has not been published. Its stabilization work inc
 - SQLite safety: upgrade the bundled SQLite and verify its runtime version.
 - Release integrity: validate release versions, locked builds, archive contents, checksums, and installer verification.
 - Project governance: document private security reporting and contribution checks, and add issue and pull request templates.
+- 查询性能:`cite` 现在使用本地建立的 `cbeta_id` 索引,不再全表扫描;索引在安装/更新时建立,已有数据在首次 `cite` 时补建,数据目录不可写时静默退回扫描。
+- 输出可读性:置信度显示为 `1.00` 时不再逐行标注 `[MITRA 1.00]`(当前数据集全部如此);`--json` 的 `confidence` 字段不变。
 
 These changes are not released until the 0.3.0 release tag is published.
