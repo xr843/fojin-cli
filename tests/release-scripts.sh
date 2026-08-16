@@ -129,6 +129,42 @@ python3 -c 'import shutil, sys; shutil.make_archive(sys.argv[2], "zip", root_dir
   "$tmp" "$tmp/valid" "$windows_staging"
 expect_pass "valid Windows archive" "$archive_check" "$tmp/valid.zip" "$windows_target" "$version"
 
+# The fixture above comes from shutil.make_archive, which writes a standalone
+# entry for the top-level directory. PowerShell's Compress-Archive — what
+# release.yml actually runs — does not: it writes only the prefixed file
+# entries, created on Windows (create_system 0, external_attr 0). v0.3.0's
+# first release run failed on exactly that shape, because make_archive could
+# never produce it. These fixtures are modelled on the real artifact.
+python3 - "$tmp/flat.zip" "$tmp/flat-missing.zip" "$windows_staging" <<'PY'
+import sys
+import zipfile
+
+
+flat_archive, missing_archive, staging = sys.argv[1:]
+files = ("fojin.exe", "README.md", "LICENSE-MIT", "LICENSE-APACHE")
+
+
+def add_windows_member(bundle, name):
+    member = zipfile.ZipInfo(name)
+    member.create_system = 0
+    member.external_attr = 0
+    bundle.writestr(member, b"fixture\n")
+
+
+with zipfile.ZipFile(flat_archive, "w") as bundle:
+    for name in files:
+        add_windows_member(bundle, f"{staging}/{name}")
+
+# Same shape, one license short. Making the directory entry optional must not
+# also relax the requirement that all four payload files are present.
+with zipfile.ZipFile(missing_archive, "w") as bundle:
+    for name in files:
+        if name != "LICENSE-APACHE":
+            add_windows_member(bundle, f"{staging}/{name}")
+PY
+expect_pass "Windows ZIP with no directory entry" "$archive_check" "$tmp/flat.zip" "$windows_target" "$version"
+expect_fail "Windows ZIP with no directory entry, missing a license" "$archive_check" "$tmp/flat-missing.zip" "$windows_target" "$version"
+
 python3 - "$tmp/symlink-directory.zip" "$tmp/fifo-file.zip" "$windows_staging" <<'PY'
 import stat
 import sys
