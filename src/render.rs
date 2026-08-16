@@ -1,7 +1,17 @@
 use crate::model::MatchGroup;
 use crate::search::{SearchOutcome, SCHEMA_VERSION};
 
-pub const FOOTER: &str = "完整上下文见 https://fojin.app  ·  数据 CC BY-SA(Dharmamitra + fojin)";
+/// Printed once per query, and the only place a CLI user is guaranteed to see
+/// the notice, so it carries every CC BY-SA 4.0 attribution condition on its
+/// own: names the creator and the source dataset, names the license and links
+/// its text, and states that the material was changed.
+///
+/// "经 fojin 归一化并打包" is the change indication, and it is also the whole
+/// of fojin's claim on this data — every alignment here is Dharmamitra's.
+/// fojin contributed the Taishō/title linkage, the simplified-Chinese
+/// normalization column, and the SQLite/FTS packaging, nothing else. The
+/// earlier "Dharmamitra + fojin" read as joint authorship of the alignments.
+pub const FOOTER: &str = "对齐数据:Dharmamitra MITRA-parallel · CC BY-SA 4.0 · 经 fojin 归一化并打包\nhttps://creativecommons.org/licenses/by-sa/4.0/ · 完整上下文见 https://fojin.app";
 
 /// Languages shown by default. Pali is deliberately absent: the current
 /// dataset (data-v1) has zero pi rows, so a permanent "(无对齐)" placeholder

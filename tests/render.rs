@@ -94,8 +94,13 @@ fn human_shows_extra_lang_and_full_footer() {
         out.contains("英  form is emptiness  [MITRA 0.75]"),
         "extra lang en prints when present"
     );
-    // full footer including the CC BY-SA attribution half (a regression to that half must fail)
-    assert!(out.contains("完整上下文见 https://fojin.app  ·  数据 CC BY-SA(Dharmamitra + fojin)"));
+    // Full footer, asserted whole: each half is a separate CC BY-SA 4.0
+    // condition (creator + license name + change indication; license URI),
+    // so dropping either half is a license regression, not a cosmetic one.
+    assert!(out.contains(
+        "对齐数据:Dharmamitra MITRA-parallel · CC BY-SA 4.0 · 经 fojin 归一化并打包\n\
+         https://creativecommons.org/licenses/by-sa/4.0/ · 完整上下文见 https://fojin.app"
+    ));
 }
 
 #[test]
@@ -292,7 +297,9 @@ fn perfect_confidence_shows_no_tag() {
         "the parallel itself stays: {out}"
     );
     assert!(
-        !out.contains("MITRA"),
+        // "[MITRA", not "MITRA": the footer names the source dataset
+        // (MITRA-parallel), so only the bracket distinguishes the conf tag.
+        !out.contains("[MITRA"),
         "a uniform 1.00 carries no information and must not be printed: {out}"
     );
 }
@@ -338,7 +345,9 @@ fn confidence_rounding_to_one_hides_the_tag() {
         out.contains("梵  rūpaṃ śūnyatā"),
         "the parallel itself stays: {out}"
     );
-    assert!(!out.contains("MITRA"), "got: {out}");
+    // "[MITRA", not "MITRA": the footer names the source dataset
+    // (MITRA-parallel), so only the bracket distinguishes the conf tag.
+    assert!(!out.contains("[MITRA"), "got: {out}");
 }
 
 #[test]
@@ -359,7 +368,9 @@ fn absent_confidence_shows_no_tag() {
         out.contains("梵  rūpaṃ śūnyatā"),
         "the parallel itself stays: {out}"
     );
-    assert!(!out.contains("MITRA"), "got: {out}");
+    // "[MITRA", not "MITRA": the footer names the source dataset
+    // (MITRA-parallel), so only the bracket distinguishes the conf tag.
+    assert!(!out.contains("[MITRA"), "got: {out}");
 }
 
 #[test]
