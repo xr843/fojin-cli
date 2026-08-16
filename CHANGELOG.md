@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-08-16
+
+- 发布校验:`check-release-archive.sh` 不再把顶层目录条目当作压缩包的必需成员。GNU tar 会写这个条目,构建 Windows zip 的 PowerShell `Compress-Archive` 不写,于是 v0.3.0 的 release 运行在四个平台全部构建成功、三个 tar.gz 全部通过之后卡在 Windows zip 上,GitHub Release 没能发出。压缩包本身一直是对的。其余约束一条未放宽(成员不得落在顶层目录之外、四个文件必须齐全、Unix 二进制必须可执行、目录条目若存在仍必须是目录),并补上按真实 Windows 产物建模的回归测试——此前的 fixture 由 `shutil.make_archive` 生成,复现的是发布流水线不产出的形状。
+
+**0.3.0 只发到了 crates.io,没有 GitHub 二进制 release**(即上述失败)。需要预编译二进制或使用 `install.sh` 的,请用 0.3.1。
+
 ## [0.3.0] - 2026-08-16
 
 本版把 0.2.1 之后的稳定化工作一次发出。它同时修好了一处只有发布才能修的故障:
