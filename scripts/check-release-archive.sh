@@ -20,7 +20,15 @@ version = sys.argv[3]
 top = f"fojin-{version}-{target}"
 binary = "fojin.exe" if target.endswith("-windows-msvc") else "fojin"
 required_files = {binary, "README.md", "LICENSE-MIT", "LICENSE-APACHE"}
-expected = {top, *(f"{top}/{name}" for name in required_files)}
+required = {f"{top}/{name}" for name in required_files}
+# The standalone entry for the top-level directory is allowed but not required.
+# GNU tar writes one; PowerShell's Compress-Archive, which builds the Windows
+# zip, writes only the prefixed file entries. Its absence says nothing about
+# what the archive contains, so demanding it rejects a perfectly good zip.
+# Everything else stays mandatory: no member may sit outside `top/`, all four
+# required files must be present, and if the directory entry IS there it still
+# has to be a directory (that is what catches a directory-shaped symlink).
+allowed = required | {top}
 
 
 def checked_name(name: str) -> str:
@@ -40,7 +48,7 @@ def validate_members(members):
         if name in seen:
             raise ValueError(f"duplicate archive member: {name}")
         seen.add(name)
-        if name not in expected:
+        if name not in allowed:
             raise ValueError(f"unexpected archive member: {name}")
         if name == top:
             if kind != "directory":
@@ -50,7 +58,7 @@ def validate_members(members):
         if name == f"{top}/{binary}":
             unix_binary_mode = mode
 
-    missing = expected - seen
+    missing = required - seen
     if missing:
         raise ValueError("missing archive members: " + ", ".join(sorted(missing)))
     if binary == "fojin" and (unix_binary_mode is None or unix_binary_mode & 0o111 == 0):
