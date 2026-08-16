@@ -4,5 +4,6 @@
 *.sqlite.gz.sha256
 __pycache__/
 
-# internal design docs (spec/plan) kept out of the public repo
-/docs/
+# Internal design docs (spec/plan) are not added to the public repo. Scoped to
+# that subtree so /docs/ can also hold user-facing pages the README links to.
+/docs/superpowers/

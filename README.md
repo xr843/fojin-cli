@@ -25,44 +25,24 @@ https://creativecommons.org/licenses/by-sa/4.0/ · 完整上下文见 https://fo
 
 ## 安装
 
-从 crates.io 或源码构建要求 **Rust 1.95 或更新版本**（MSRV 1.95）；使用预编译二进制不需要安装 Rust。
-
-通过 [crates.io](https://crates.io/crates/fojin-cli) 安装(命令为 `fojin`）：
-
-```bash
-cargo install fojin-cli --locked
-```
-
-没有 Rust 环境?一行脚本自动安装对应平台的预编译二进制(Linux x64 / macOS ARM+Intel)：
+**没有 Rust 环境** —— 一行脚本装好对应平台的预编译二进制(Linux x64 / macOS ARM+Intel)：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xr843/fojin-cli/master/install.sh | sh
 ```
 
-这项校验合同从 **v0.3.0** 起适用：安装脚本要求它解析出的最新版本或 `FOJIN_VERSION` 指定的目标
-**二进制 release** 同时提供 `SHA256SUMS`，并在解压和安装前用 `sha256sum` 或 `shasum -a 256`
-核对 archive；缺少校验工具、校验记录不唯一或摘要不匹配时都会停止安装。
+脚本在解压前用该 release 的 `SHA256SUMS` 核对 archive,校验不过就中止,不会落地二进制。
 
-如果目标二进制 release 早于 v0.3.0（包括 v0.3.0 尚未发布的过渡窗口中，脚本自动解析到旧版），
-旧 release 没有 `SHA256SUMS` 时脚本会在解压前安全失败。此时请改用 crates.io 当前已发布版本，
-或从源码构建；这段说明不表示 v0.3.0 已经发布。
-
-也可从 [Releases](https://github.com/xr843/fojin-cli/releases/latest) 手动下载各平台二进制(含 Windows x64 zip),或从源码安装：
+**有 Rust** —— 要求 **1.95+**(MSRV 1.95),装好后的命令名是 `fojin`：
 
 ```bash
-cargo install --git https://github.com/xr843/fojin-cli --locked
+cargo install fojin-cli --locked
+# 或直接从源码:cargo install --git https://github.com/xr843/fojin-cli --locked
 ```
 
-手动下载时请一并下载同一 release 的 `SHA256SUMS`，并在解压前核对所下载 archive 的 SHA-256。
-例如 GNU `sha256sum` 可从清单中筛选对应文件后校验（将占位符替换为 release 中的实际名称）：
-
-```bash
-archive="fojin-<VERSION>-<TARGET>.tar.gz"
-grep "  ${archive}$" SHA256SUMS | sha256sum -c -
-```
-
-macOS 可将最后一段换为 `shasum -a 256 -c -`；Windows 可用 `Get-FileHash -Algorithm SHA256`
-并与 `SHA256SUMS` 中对应的唯一记录比较。
+**Windows 或想手动下载** —— 从 [Releases](https://github.com/xr843/fojin-cli/releases/latest)
+取各平台二进制(含 Windows x64 zip),并一并下载**同一个 release** 的 `SHA256SUMS` 自行核对。
+校验合同、环境变量与各平台的核对命令见 [`docs/install-verification.md`](docs/install-verification.md)。
 
 首次运行 `fojin parallel` 会自动下载对齐数据集(约 183 MB,带进度显示,见下方「数据集」),之后完全离线。
 
@@ -198,15 +178,10 @@ fojin parallel "<汉文短语>" --json --offline
   - 藏 / Tibetan:676,898 条
   - 梵 / Sanskrit:231,722 条
 - 来源:Dharmamitra 的 [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) 对齐数据集([Nehrdich & Keutzer, 2026](https://arxiv.org/pdf/2601.06400)),以 GitHub Release(`data-v1`)形式分发;学术使用请引用原论文(BibTeX 见 [`DATA_LICENSE`](DATA_LICENSE))。
-- 当前数据集(`data-v1`)所有对齐的置信度均为 1.00,不具区分度,因此人类可读输出不再逐行标注;
-  `--json` 的 `confidence` 字段保持输出。未来数据若提供真实分数,低于 1.00 的会自动显示。
-- 当前二进制把官方下载地址、SHA-256 与兼容元数据固定在 `data-v1`;`fojin data update` 只会重新获取这份固定数据,不会自动切换到未来的数据主版本。版本、归一化规则或查询所需 schema 不兼容的数据会被拒绝。
 - 首次运行时下载,压缩包约 **183 MB**,解压并建好按经号索引后约 **578 MB**(SQLite)。下载后完全离线可用。
-- 安装和更新采用有界的磁盘流式传输,不再在内存中缓冲完整压缩包或数据库;压缩响应上限为 **256 MiB**,解压后的数据库上限为 **768 MiB**。更新期间可能临时需要现用数据库所占空间,外加约 **761 MiB** 暂存磁盘空间(约 183 MiB 压缩包 + 约 578 MiB 候选数据库)。
-- HTTP DNS 解析与连接超时均为 **30 秒**,响应头和响应体的空闲读取超时均为 **60 秒**,并以跨重定向、覆盖 DNS 到响应体读取的 **15 分钟端到端硬时限** 为上限。
-- 同一数据目录上的首次安装、更新和清理操作按 single-flight 串行执行;等待者最多等待 **20 分钟**。永久保留的 `data.sqlite.lock` 文件是无害的协调文件,`fojin data clean` 会有意保留它。
-- 离线查询行为及固定到 `data-v1` 的校验和契约保持不变。
-- 当前不含巴利对齐(上游 MITRA-parallel 尚未覆盖巴利),默认输出不显示巴利行;显式 `--lang pi` 仍可查询(如实答「未找到对齐」)。程序的渲染路径可兼容未来新增语言行,但当前官方下载通道仍固定为 `data-v1`;上游出现新语言不代表当前二进制会自动获得它。**渲染兼容不等于官方更新通道无需升级**,未来数据版本可能要求升级二进制或明确切换数据发布。
+- 当前不含巴利对齐(上游 MITRA-parallel 尚未覆盖巴利),默认输出不显示巴利行;显式 `--lang pi` 仍可查询(如实答「未找到对齐」)。
+- 磁盘与传输限额、超时、并发串行化、`data-v1` 版本固定策略、置信度字段与中断恢复,见
+  [`docs/data-operations.md`](docs/data-operations.md)。
 - 许可:**CC BY-SA 4.0**(<https://creativecommons.org/licenses/by-sa/4.0/>)。**全部对齐内容归 Dharmamitra**;
   fojin 做的是加工层——Taishō 编号/经名/卷号的关联、简繁归一化列、SQLite+FTS 打包,并按 ShareAlike 以同一许可分发。
   改动清单见 [`DATA_LICENSE`](DATA_LICENSE)。
@@ -241,13 +216,10 @@ fojin data verify                 # verify version, SQLite, and FTS integrity
 ```
 
 - **Input**: Chinese by default (traditional/simplified folded, punctuation ignored); literal substring matching over normalized text, 2-to-12-character phrases work best. A whole-string miss auto-splits into sentences and retries (`--no-split` disables this; up to 20 sentences are processed, and the output states explicitly if more were skipped), falling back to the longest matchable substring per sentence — skipped once the normalized text exceeds 60 characters, and the returned substring is itself normalized (simplified, punctuation stripped), so it may not match the original characters. `--from sa`/`--from bo` reverses the query direction (Sanskrit/Tibetan → Chinese, full Unicode case folding — diacritics must still match exactly) without splitting or falling back.
-- **Build/install integrity**: building from crates.io or source requires Rust 1.95+ (MSRV 1.95). Starting with v0.3.0, the shell installer requires the target binary release to provide `SHA256SUMS` and verifies the archive before extraction. It fails closed for an older latest or explicitly selected release without that file, including the transition before v0.3.0 is published; use the currently published crates.io version or a source build instead. This does not state that v0.3.0 has been released.
+- **Build/install integrity**: prebuilt binaries need no Rust; building from crates.io or source requires Rust 1.95+ (MSRV 1.95). The shell installer verifies the archive against that release's `SHA256SUMS` before extraction and fails closed if the file is missing, ambiguous, or mismatched — see [`docs/install-verification.md`](docs/install-verification.md).
 - **For AI agents**: pure-JSON stdout, semantic exit codes (`0` ok / `1` runtime / `2` usage), zero network with `--offline`. Ready-made Claude Code integration in [`examples/claude/`](examples/claude/).
-- **Data**: 908,620 zh↔sa/bo alignments from Dharmamitra's [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) dataset, redistributed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). **All alignments are Dharmamitra's**; fojin's contribution is the processing layer — Taishō/title/fascicle linkage, a simplified-Chinese normalization column, and SQLite+FTS packaging — redistributed under the same license per ShareAlike (change list in [`DATA_LICENSE`](DATA_LICENSE)). The official URL, checksum, and compatibility contract remain pinned to `data-v1`; rendering support for future language rows does not mean the official update channel can adopt them without a binary upgrade. Academic use: please cite [Nehrdich & Keutzer (2026)](https://arxiv.org/pdf/2601.06400) — BibTeX in [`DATA_LICENSE`](DATA_LICENSE).
-- **Data transfer resources**: installs and updates use bounded, disk-streamed transfers and no longer buffer the complete archive or database in memory. Compressed responses are capped at **256 MiB** and decompressed databases at **768 MiB**. An update can temporarily require the live database plus roughly **761 MiB** of staging disk (about 183 MiB for the archive and 578 MiB for the candidate database).
-- **Data timeouts**: HTTP DNS resolution and connection timeouts are both **30 seconds**, response-header and response-body idle-read timeouts are both **60 seconds**, and a **15-minute hard end-to-end deadline** spans redirects from DNS through the final body read.
-- **Concurrent data operations**: initial install, update, and clean operations on one data directory are single-flight; a waiter may wait up to **20 minutes**. The permanent `data.sqlite.lock` file is harmless coordination state and intentionally survives `fojin data clean`.
-- **Stable query contract**: offline queries and the checksum contract pinned to `data-v1` are unchanged.
+- **Data**: 908,620 zh↔sa/bo alignments from Dharmamitra's [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) dataset, redistributed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). **All alignments are Dharmamitra's**; fojin's contribution is the processing layer — Taishō/title/fascicle linkage, a simplified-Chinese normalization column, and SQLite+FTS packaging — redistributed under the same license per ShareAlike (change list in [`DATA_LICENSE`](DATA_LICENSE)). Academic use: please cite [Nehrdich & Keutzer (2026)](https://arxiv.org/pdf/2601.06400) — BibTeX in [`DATA_LICENSE`](DATA_LICENSE).
+- **Data operations**: transfer caps, timeouts, single-flight concurrency, `data-v1` version pinning, the confidence field, and interrupted-write recovery are documented in [`docs/data-operations.md`](docs/data-operations.md).
 - **Not in scope**: semantic search, Pāli, translation — use [Dharmamitra](https://dharmamitra.org)'s online APIs for those; the two are complementary.
 - **License**: code MIT OR Apache-2.0; data [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) (alignments by Dharmamitra, adapted and packaged by fojin).
 
