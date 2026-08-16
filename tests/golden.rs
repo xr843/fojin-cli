@@ -27,6 +27,7 @@ fn hit_path_human_output_is_byte_identical() {
          梵  rūpaṃ śūnyatā  [MITRA 0.91]\n\
          藏  (无对齐)\n\
          \n\
-         完整上下文见 https://fojin.app  ·  数据 CC BY-SA(Dharmamitra + fojin)\n"
+         对齐数据:Dharmamitra MITRA-parallel · CC BY-SA 4.0 · 经 fojin 归一化并打包\n\
+         https://creativecommons.org/licenses/by-sa/4.0/ · 完整上下文见 https://fojin.app\n"
     );
 }

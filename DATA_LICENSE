@@ -1,11 +1,43 @@
 The data artifact distributed with fojin-cli (fojin-parallels-*.sqlite[.gz])
-is licensed CC BY-SA 4.0.
+is licensed CC BY-SA 4.0 — https://creativecommons.org/licenses/by-sa/4.0/
 
-Attribution: Dharmamitra (https://dharmamitra.org) + fojin.app.
-Source alignments imported from Dharmamitra's open MITRA-parallel dataset
-(https://github.com/dharmamitra/mitra-parallel, CC BY-SA 4.0).
+## Source and attribution
 
-If you use this data in academic work, please cite the MITRA paper:
+Every cross-canon alignment in this artifact comes from Dharmamitra's
+MITRA-parallel dataset. None of the alignments are fojin's own.
+
+  Alignments:  Dharmamitra — https://dharmamitra.org
+               MITRA-parallel — https://github.com/dharmamitra/mitra-parallel
+               released CC BY-SA 4.0 (stated by Dharmamitra in that
+               repository's v1/README.md, "License" section; the repository
+               has no top-level LICENSE file)
+  Packaging:   fojin.app — https://fojin.app
+
+## Changes made by fojin (CC BY-SA 4.0 §3(a)(1)(B) change indication)
+
+This artifact is an adaptation of MITRA-parallel, not a verbatim copy. The
+alignment text itself is unaltered; what fojin added is a processing layer:
+
+  - Linked each alignment to its Taishō number (cbeta_id), Chinese title
+    (title_zh) and fascicle number (juan_num). MITRA-parallel v1 ships four
+    TSV columns (src_segmentnr, src_original, tgt_segmentnr, tgt_original)
+    and carries no title or fascicle field.
+  - Added a normalized query column (zh_norm): 1:1 traditional-to-simplified
+    character folding plus punctuation stripping, ruleset "t2s-char-1to1-v1".
+  - Restructured the corpus into SQLite with an FTS5 trigram index, and
+    dropped rows with an empty zh_text or foreign_text.
+
+Per ShareAlike, this adapted artifact is distributed under the same license.
+
+## Scope
+
+This artifact contains MITRA cross-canon parallels ONLY. fojin's own curated
+alignment_pairs are NOT included.
+
+## Citation (requested by the dataset authors, not a license condition)
+
+If you use this data in academic work, Dharmamitra asks that you cite the
+MITRA paper:
 
   @article{nehrdich2026mitra,
     title={MITRA: A Large-Scale Parallel Corpus and Multilingual Pretrained
@@ -16,6 +48,3 @@ If you use this data in academic work, please cite the MITRA paper:
     year={2026},
     url={https://arxiv.org/pdf/2601.06400}
   }
-
-Note: this artifact contains MITRA cross-canon parallels ONLY. fojin's own
-curated alignment_pairs are NOT included.

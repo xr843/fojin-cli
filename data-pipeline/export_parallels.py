@@ -76,10 +76,21 @@ def build(db_url: str, out_path: str, version: str = "v1") -> str:
             )
             row_count += 1
 
+    # The .sqlite can be redistributed on its own, so its meta must carry the
+    # CC BY-SA notice without the repo: creator, license, license URI, and the
+    # fact that fojin adapted it. "Dharmamitra + fojin.app" read as joint
+    # authorship of the alignments; every alignment here is Dharmamitra's and
+    # fojin's claim is only the processing layer named below.
+    #
+    # Editing meta changes the artifact bytes and therefore its SHA-256. The
+    # published data-v1 is pinned by DATA_SHA256 in src/cli.rs and keeps the
+    # old string; this takes effect at the next data version, where DATA_SHA256
+    # must be updated to the digest printed by this script.
     meta = {
         "version": version,
         "license": "CC BY-SA 4.0",
-        "attribution": "Dharmamitra + fojin.app",
+        "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+        "attribution": "Alignments by Dharmamitra (MITRA-parallel); Taisho/title/fascicle linkage, zh_norm column and SQLite+FTS packaging by fojin.app",
         "row_count": str(row_count),
         "norm_ruleset": "t2s-char-1to1-v1",
     }

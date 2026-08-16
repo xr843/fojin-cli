@@ -17,7 +17,8 @@ $ fojin parallel "色即是空"
 
 … 还有 38 组匹配,加 --all 查看全部
 
-完整上下文见 https://fojin.app  ·  数据 CC BY-SA(Dharmamitra + fojin)
+对齐数据:Dharmamitra MITRA-parallel · CC BY-SA 4.0 · 经 fojin 归一化并打包
+https://creativecommons.org/licenses/by-sa/4.0/ · 完整上下文见 https://fojin.app
 ```
 
 > 这不是 fojin.app 的账号客户端 —— 它不联网(首次下载数据后)、不需要登录。
@@ -206,14 +207,17 @@ fojin parallel "<汉文短语>" --json --offline
 - 同一数据目录上的首次安装、更新和清理操作按 single-flight 串行执行;等待者最多等待 **20 分钟**。永久保留的 `data.sqlite.lock` 文件是无害的协调文件,`fojin data clean` 会有意保留它。
 - 离线查询行为及固定到 `data-v1` 的校验和契约保持不变。
 - 当前不含巴利对齐(上游 MITRA-parallel 尚未覆盖巴利),默认输出不显示巴利行;显式 `--lang pi` 仍可查询(如实答「未找到对齐」)。程序的渲染路径可兼容未来新增语言行,但当前官方下载通道仍固定为 `data-v1`;上游出现新语言不代表当前二进制会自动获得它。**渲染兼容不等于官方更新通道无需升级**,未来数据版本可能要求升级二进制或明确切换数据发布。
-- 许可:**CC BY-SA 4.0**(Dharmamitra + fojin)。
+- 许可:**CC BY-SA 4.0**(<https://creativecommons.org/licenses/by-sa/4.0/>)。**全部对齐内容归 Dharmamitra**;
+  fojin 做的是加工层——Taishō 编号/经名/卷号的关联、简繁归一化列、SQLite+FTS 打包,并按 ShareAlike 以同一许可分发。
+  改动清单见 [`DATA_LICENSE`](DATA_LICENSE)。
 - 范围:仅含 MITRA 跨藏平行;fojin 自有的精选对齐(alignment_pairs)**未包含**在本数据集中。
 - 未来可能提供体积更小的 lite 子集,供带宽/存储受限场景使用(尚未实现)。
 
 ## 许可
 
 - **代码**:MIT OR Apache-2.0,见 [`LICENSE-MIT`](LICENSE-MIT) / [`LICENSE-APACHE`](LICENSE-APACHE)。
-- **数据**:CC BY-SA 4.0(Dharmamitra + fojin),见 [`DATA_LICENSE`](DATA_LICENSE)。
+- **数据**:CC BY-SA 4.0(<https://creativecommons.org/licenses/by-sa/4.0/>),对齐来自 Dharmamitra 的 MITRA-parallel、
+  由 fojin 归一化并打包,见 [`DATA_LICENSE`](DATA_LICENSE)。
 
 代码与数据的许可证是分开的 —— 使用/分发本项目产出的数据集时,请遵循 `DATA_LICENSE`(署名 + 相同方式共享),与代码许可无关。
 
@@ -239,12 +243,12 @@ fojin data verify                 # verify version, SQLite, and FTS integrity
 - **Input**: Chinese by default (traditional/simplified folded, punctuation ignored); literal substring matching over normalized text, 2-to-12-character phrases work best. A whole-string miss auto-splits into sentences and retries (`--no-split` disables this; up to 20 sentences are processed, and the output states explicitly if more were skipped), falling back to the longest matchable substring per sentence — skipped once the normalized text exceeds 60 characters, and the returned substring is itself normalized (simplified, punctuation stripped), so it may not match the original characters. `--from sa`/`--from bo` reverses the query direction (Sanskrit/Tibetan → Chinese, full Unicode case folding — diacritics must still match exactly) without splitting or falling back.
 - **Build/install integrity**: building from crates.io or source requires Rust 1.95+ (MSRV 1.95). Starting with v0.3.0, the shell installer requires the target binary release to provide `SHA256SUMS` and verifies the archive before extraction. It fails closed for an older latest or explicitly selected release without that file, including the transition before v0.3.0 is published; use the currently published crates.io version or a source build instead. This does not state that v0.3.0 has been released.
 - **For AI agents**: pure-JSON stdout, semantic exit codes (`0` ok / `1` runtime / `2` usage), zero network with `--offline`. Ready-made Claude Code integration in [`examples/claude/`](examples/claude/).
-- **Data**: 908,620 zh↔sa/bo alignments from Dharmamitra's [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) dataset, redistributed under CC BY-SA 4.0. The official URL, checksum, and compatibility contract remain pinned to `data-v1`; rendering support for future language rows does not mean the official update channel can adopt them without a binary upgrade. Academic use: please cite [Nehrdich & Keutzer (2026)](https://arxiv.org/pdf/2601.06400) — BibTeX in [`DATA_LICENSE`](DATA_LICENSE).
+- **Data**: 908,620 zh↔sa/bo alignments from Dharmamitra's [MITRA-parallel](https://github.com/dharmamitra/mitra-parallel) dataset, redistributed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). **All alignments are Dharmamitra's**; fojin's contribution is the processing layer — Taishō/title/fascicle linkage, a simplified-Chinese normalization column, and SQLite+FTS packaging — redistributed under the same license per ShareAlike (change list in [`DATA_LICENSE`](DATA_LICENSE)). The official URL, checksum, and compatibility contract remain pinned to `data-v1`; rendering support for future language rows does not mean the official update channel can adopt them without a binary upgrade. Academic use: please cite [Nehrdich & Keutzer (2026)](https://arxiv.org/pdf/2601.06400) — BibTeX in [`DATA_LICENSE`](DATA_LICENSE).
 - **Data transfer resources**: installs and updates use bounded, disk-streamed transfers and no longer buffer the complete archive or database in memory. Compressed responses are capped at **256 MiB** and decompressed databases at **768 MiB**. An update can temporarily require the live database plus roughly **761 MiB** of staging disk (about 183 MiB for the archive and 578 MiB for the candidate database).
 - **Data timeouts**: HTTP DNS resolution and connection timeouts are both **30 seconds**, response-header and response-body idle-read timeouts are both **60 seconds**, and a **15-minute hard end-to-end deadline** spans redirects from DNS through the final body read.
 - **Concurrent data operations**: initial install, update, and clean operations on one data directory are single-flight; a waiter may wait up to **20 minutes**. The permanent `data.sqlite.lock` file is harmless coordination state and intentionally survives `fojin data clean`.
 - **Stable query contract**: offline queries and the checksum contract pinned to `data-v1` are unchanged.
 - **Not in scope**: semantic search, Pāli, translation — use [Dharmamitra](https://dharmamitra.org)'s online APIs for those; the two are complementary.
-- **License**: code MIT OR Apache-2.0; data CC BY-SA 4.0.
+- **License**: code MIT OR Apache-2.0; data [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) (alignments by Dharmamitra, adapted and packaged by fojin).
 
 Part of the [fojin](https://fojin.app) open tool suite — fojin.app is the online reading & parallel-reading platform; fojin-cli is its offline, no-login companion.
