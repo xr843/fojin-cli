@@ -2,9 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-08-16
 
-Version 0.3.0 is prepared but has not been published. Its stabilization work includes:
+本版把 0.2.1 之后的稳定化工作一次发出。它同时修好了一处只有发布才能修的故障:
+`install.sh` 要求目标 release 提供 `SHA256SUMS`,而在本版发布前它解析到的最新版本
+一直是 v0.2.1 —— 那个 release 早于这项校验合同、没有该文件,于是一行安装命令对所有
+人都以 404 失败。本版起 `SHA256SUMS` 随每个 release 发布,该路径恢复可用。
+
+包含的改动:
 
 - Data verification: strengthen `fojin data verify` and dataset compatibility checks.
 - Data pipeline: move installs and updates to a bounded, disk-streamed, checksum-first pipeline with hard end-to-end HTTP deadlines and rollback-safe Windows replacement backups.
@@ -19,5 +24,3 @@ Version 0.3.0 is prepared but has not been published. Its stabilization work inc
 - 输出可读性:置信度显示为 `1.00` 时不再逐行标注 `[MITRA 1.00]`(当前数据集全部如此);`--json` 的 `confidence` 字段不变。
 - 文档:README 收敛到「怎么装、怎么查、数据从哪来」。安装校验合同与各平台核对命令移入 `docs/install-verification.md`,传输限额/超时/并发/版本固定/中断恢复移入 `docs/data-operations.md`。
 - 数据署名:修正 CC BY-SA 4.0 署名。此前的 `Dharmamitra + fojin` 把两家并列成对齐内容的共同来源,而全部对齐均来自 Dharmamitra 的 MITRA-parallel,fojin 只做加工层(Taishō 编号/经名/卷号关联、简繁归一化列、SQLite+FTS 打包)。人类可读输出的脚注、`README`、`DATA_LICENSE` 现在分层署名,并补上此前全仓库缺失的许可文本链接与「已作改动」声明。`--json` 输出与数据文件本身不变(数据 meta 表的署名在下一个数据版本生效)。
-
-These changes are not released until the 0.3.0 release tag is published.
